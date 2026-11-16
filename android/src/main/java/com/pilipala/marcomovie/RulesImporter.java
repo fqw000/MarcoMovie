@@ -75,14 +75,18 @@ final class RulesImporter {
             if (domain != null) domains.add(domain);
         }
         if (domains.isEmpty()) return null;
-        JSONObject root = new JSONObject();
-        root.put("version", 2);
-        root.put("playlistRules", new JSONArray());
-        root.put("hostRules", new JSONArray());
-        root.put("blockedDomains", new JSONArray(new ArrayList<>(domains)));
-        root.put("blockedUrlPatterns", new JSONArray());
-        root.put("heuristics", defaultHeuristics());
-        return root.toString();
+        try {
+            JSONObject root = new JSONObject();
+            root.put("version", 2);
+            root.put("playlistRules", new JSONArray());
+            root.put("hostRules", new JSONArray());
+            root.put("blockedDomains", new JSONArray(new ArrayList<>(domains)));
+            root.put("blockedUrlPatterns", new JSONArray());
+            root.put("heuristics", defaultHeuristics());
+            return root.toString();
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     /** Maps an m3u8-proxy-style rule JSON (regex/keyword lists) to global playlist rules. */
@@ -139,25 +143,32 @@ final class RulesImporter {
         }
         for (String domain : domainSet) domains.put(domain);
         for (String pattern : urlSet) urlPatterns.put(pattern);
-        JSONObject root = new JSONObject();
-        root.put("version", 2);
-        root.put("playlistRules", playlist);
-        root.put("hostRules", hostRules);
-        root.put("blockedDomains", domains);
-        root.put("blockedUrlPatterns", urlPatterns);
-        root.put("heuristics", defaultHeuristics());
-        return root.toString();
+        try {
+            JSONObject root = new JSONObject();
+            root.put("version", 2);
+            root.put("playlistRules", playlist);
+            root.put("hostRules", hostRules);
+            root.put("blockedDomains", domains);
+            root.put("blockedUrlPatterns", urlPatterns);
+            root.put("heuristics", defaultHeuristics());
+            return root.toString();
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static JSONObject defaultHeuristics() {
         JSONObject heuristics = new JSONObject();
-        heuristics.put("enabled", true);
-        heuristics.put("minAdBlockDurationSec", 3);
-        heuristics.put("maxAdBlockDurationSec", 75);
-        heuristics.put("minAdBlockSegments", 2);
-        heuristics.put("urlPrefixAnomaly", true);
-        heuristics.put("keyNoneSwitch", true);
-        heuristics.put("mirrorReuse", true);
+        try {
+            heuristics.put("enabled", true);
+            heuristics.put("minAdBlockDurationSec", 3);
+            heuristics.put("maxAdBlockDurationSec", 75);
+            heuristics.put("minAdBlockSegments", 2);
+            heuristics.put("urlPrefixAnomaly", true);
+            heuristics.put("keyNoneSwitch", true);
+            heuristics.put("mirrorReuse", true);
+        } catch (Exception ignored) {
+        }
         return heuristics;
     }
 
