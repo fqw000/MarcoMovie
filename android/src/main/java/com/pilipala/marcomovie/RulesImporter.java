@@ -216,8 +216,9 @@ final class RulesImporter {
         }
         if (value instanceof JSONObject) {
             JSONObject object = (JSONObject) value;
-            for (String key : object.keySet()) {
-                Object element = object.opt(key);
+            java.util.Iterator<String> keys = object.keys();
+            while (keys.hasNext()) {
+                Object element = object.opt(keys.next());
                 if (element instanceof String) {
                     String trimmed = ((String) element).trim();
                     if (!trimmed.isEmpty()) out.add(trimmed);
@@ -240,7 +241,8 @@ final class RulesImporter {
         }
         if (value instanceof JSONObject) {
             JSONObject object = (JSONObject) value;
-            for (String key : object.keySet()) collectAllStrings(object.opt(key), out);
+            java.util.Iterator<String> keys = object.keys();
+            while (keys.hasNext()) collectAllStrings(object.opt(keys.next()), out);
         }
     }
 }
