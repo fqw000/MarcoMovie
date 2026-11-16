@@ -57,6 +57,7 @@ final class Prefs {
     static final String SEARCH_THREADS = "search_threads";
     static final String SEARCH_TIMEOUT = "search_timeout";
     static final String EPISODES_DESCENDING = "episodes_descending";
+    static final String AD_FILTER_ENABLED = "ad_filter_enabled";
 
     // Runtime state & user data keys (excluded from settings-only reset/restore).
     static final String ORIGIN = "origin";
@@ -72,6 +73,7 @@ final class Prefs {
     static final String WATCH_HISTORY = "watch_history";
     static final String GLOBAL_SEARCH_HISTORY = "global_search_history";
     static final String PHONETIC_TITLES = "phonetic_titles";
+    static final String AD_FILTER_RULES_JSON = "ad_filter_rules_json";
 
     // Multi-device cloud (WebDAV) & LAN sync keys (kept outside KEYS so UI reset preserves sync).
     static final String WEBDAV_URL = "webdav_url";
@@ -136,7 +138,8 @@ final class Prefs {
         AUDIO_EFFECT,
         SEARCH_THREADS,
         SEARCH_TIMEOUT,
-        EPISODES_DESCENDING
+        EPISODES_DESCENDING,
+        AD_FILTER_ENABLED
     };
 
     private static final Set<String> BOOLEAN_KEYS =
@@ -154,7 +157,8 @@ final class Prefs {
                                     SOFTWARE_AUDIO,
                                     PREFER_AAC,
                                     TUNNELED_PLAYBACK,
-                                    EPISODES_DESCENDING)));
+                                    EPISODES_DESCENDING,
+                                    AD_FILTER_ENABLED)));
 
     private static final Map<String, int[]> INT_RANGES;
 

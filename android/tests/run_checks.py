@@ -26,3 +26,4 @@ try:
 finally:server.shutdown()
 subprocess.run([sys.executable, str(test/'run_cloud_sync_checks.py')], check=True)
 subprocess.run([sys.executable, str(test/'run_secure_storage_checks.py')], check=True)
+subprocess.run([sys.executable, str(test/'run_ad_filter_checks.py')], check=True)

@@ -1,0 +1,52 @@
+{
+  "version": 2,
+  "playlistRules": [
+    {"type": "regex", "pattern": "/ad/"},
+    {"type": "regex", "pattern": "/ads/"},
+    {"type": "regex", "pattern": "_ad_"},
+    {"type": "regex", "pattern": "_ads_"},
+    {"type": "keyword", "pattern": "sponsor"},
+    {"type": "keyword", "pattern": "promo"},
+    {"type": "keyword", "pattern": "splash"},
+    {"type": "keyword", "pattern": "vip_ad"},
+    {"type": "keyword", "pattern": "advert"},
+    {"type": "keyword", "pattern": "interstitial"}
+  ],
+  "hostRules": [],
+  "blockedDomains": [
+    "doubleclick.net",
+    "googlesyndication.com",
+    "adservice.google.com",
+    "googleadservices.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "google-analytics.com",
+    "scorecardresearch.com",
+    "moatads.com",
+    "adsrvr.org",
+    "adnxs.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "adform.net",
+    "advertising.com",
+    "adroll.com",
+    "casalemedia.com",
+    "quantserve.com",
+    "chartbeat.com"
+  ],
+  "blockedUrlPatterns": [],
+  "heuristics": {
+    "enabled": true,
+    "minAdBlockDurationSec": 3,
+    "maxAdBlockDurationSec": 75,
+    "minAdBlockSegments": 2,
+    "urlPrefixAnomaly": true,
+    "keyNoneSwitch": true,
+    "mirrorReuse": true
+  }
+}

@@ -137,6 +137,82 @@ final class SettingsScreen {
         }
     }
 
+    void showAdFilterRulesDialog() {
+        String[] labels = {"恢复内置规则", "从剪贴板导入"};
+        if (!a.isTvDevice()) {
+            MobileShell.showDrawerPicker(
+                    a, "去广告规则", adFilterRuleSummary(), labels, -1, this::handleAdFilterImport);
+        } else {
+            new AppDialog.Builder(a)
+                    .setTitle("去广告规则")
+                    .setItems(labels, (d, which) -> handleAdFilterImport(which))
+                    .setNegativeButton("关闭", null)
+                    .show();
+        }
+    }
+
+    private void handleAdFilterImport(int which) {
+        if (which == 0) {
+            a.prefs.edit().remove(Prefs.AD_FILTER_RULES_JSON).apply();
+            a.toast("已恢复内置去广告规则");
+            a.refresh();
+            return;
+        }
+        if (which == 1) {
+            importAdFilterFromClipboard();
+        }
+    }
+
+    private void importAdFilterFromClipboard() {
+        android.content.ClipboardManager clipboard =
+                (android.content.ClipboardManager)
+                        a.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+        if (clipboard == null || !clipboard.hasPrimaryClip()) {
+            a.toast("剪贴板为空");
+            return;
+        }
+        CharSequence raw = clipboard.getPrimaryClip().getItemAt(0).coerceToText(a);
+        if (raw == null || raw.toString().trim().isEmpty()) {
+            a.toast("剪贴板内容为空");
+            return;
+        }
+        String converted = importAdFilterText(raw.toString().trim());
+        if (converted == null) {
+            a.toast("未识别的规则格式");
+            return;
+        }
+        a.prefs.edit().putString(Prefs.AD_FILTER_RULES_JSON, converted).apply();
+        a.toast("已导入去广告规则");
+        a.refresh();
+    }
+
+    private static String importAdFilterText(String text) {
+        String trimmed = text.trim();
+        if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+            if (AdFilterRules.parse(trimmed).hasAnyRule()) return trimmed;
+            String xc = RulesImporter.fromXcJson(trimmed);
+            if (xc != null) return xc;
+            String proxy = RulesImporter.fromM3u8Proxy(trimmed);
+            if (proxy != null) return proxy;
+            return null;
+        }
+        return RulesImporter.fromAntiAd(trimmed);
+    }
+
+    private String adFilterRuleSummary() {
+        boolean enabled = a.prefs.getBoolean(Prefs.AD_FILTER_ENABLED, true);
+        if (!enabled) return "已关闭";
+        String stored = a.prefs.getString(Prefs.AD_FILTER_RULES_JSON, "");
+        if (stored == null || stored.trim().isEmpty()) return "内置规则 + 启发式识别";
+        AdFilterRules rules = AdFilterRules.parse(stored);
+        int count =
+                rules.globalRegex.size()
+                        + rules.globalKeywords.size()
+                        + rules.hostRules.size()
+                        + rules.blockedDomains.size();
+        return "自定义规则 · " + count + " 条";
+    }
+
     static Cms.Video findSortCard(java.util.List<Cms.Video> videos) {
         if (videos == null) return null;
         for (Cms.Video v : videos) {
@@ -690,6 +766,12 @@ final class SettingsScreen {
                             .show();
                 });
         toggle("自动播放下一集", Prefs.AUTO_NEXT, true, null);
+        toggle("M3U8 去广告", Prefs.AD_FILTER_ENABLED, true, null);
+        link(
+                "去广告规则",
+                adFilterRuleSummary(),
+                "setting-" + Prefs.AD_FILTER_RULES_JSON,
+                this::showAdFilterRulesDialog);
         if (a.isTvDevice()) {
             toggle("播放中右上角显示进度与时间", Prefs.TV_PLAYER_TOP_RIGHT_HUD, true, null);
         } else {

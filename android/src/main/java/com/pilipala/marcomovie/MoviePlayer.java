@@ -79,6 +79,7 @@ public class MoviePlayer {
     private OnVideoSizeChangedListener sizeListener;
     private OnErrorListener errorListener;
     private OnHdrChangedListener hdrChangedListener;
+    private OnAdFilteredListener adFilteredListener;
     private boolean readySent, unsupportedVideo, hdrVideo, unsupportedDvProfile5;
     private volatile boolean released;
     private int preparation;
@@ -95,6 +96,10 @@ public class MoviePlayer {
 
     public interface OnHdrChangedListener {
         void onHdrChanged(boolean hdr);
+    }
+
+    public interface OnAdFilteredListener {
+        void onAdFiltered(int totalRemoved);
     }
 
     public interface SubtitleListener {
@@ -524,6 +529,10 @@ public class MoviePlayer {
                 });
     }
 
+    public void setOnAdFilteredListener(OnAdFilteredListener listener) {
+        adFilteredListener = listener;
+    }
+
     public void setOnHdrChangedListener(OnHdrChangedListener listener) {
         if (exo == null) return;
         onMain(
@@ -682,6 +691,14 @@ public class MoviePlayer {
                 });
     }
 
+    private AdFilterRules loadAdFilterRules() {
+        android.content.SharedPreferences prefs = context.getSharedPreferences(Prefs.FILE, 0);
+        if (!prefs.getBoolean(Prefs.AD_FILTER_ENABLED, true)) return AdFilterRules.empty();
+        String stored = prefs.getString(Prefs.AD_FILTER_RULES_JSON, "");
+        if (stored != null && !stored.trim().isEmpty()) return AdFilterRules.parse(stored);
+        return BuiltinAdRules.load(context);
+    }
+
     private void startExoPrepare(
             Uri address,
             Map<String, String> requestHeaders,
@@ -701,9 +718,19 @@ public class MoviePlayer {
                             .setAllowCrossProtocolRedirects(true)
                             .setConnectTimeoutMs(ijkMode ? 20000 : 15000)
                             .setReadTimeoutMs(ijkMode ? 45000 : 30000);
-            DefaultDataSource.Factory data =
-                    new DefaultDataSource.Factory(
-                            context, new ChunkedProxyDataSource.Factory(http));
+            AdFilterStats stats = new AdFilterStats();
+            stats.addListener(
+                    (total, just) ->
+                            main.post(
+                                    () -> {
+                                        if (adFilteredListener != null) {
+                                            adFilteredListener.onAdFiltered(total);
+                                        }
+                                    }));
+            AdFilterDataSource.Factory ad =
+                    new AdFilterDataSource.Factory(
+                            new ChunkedProxyDataSource.Factory(http), loadAdFilterRules(), stats);
+            DefaultDataSource.Factory data = new DefaultDataSource.Factory(context, ad);
             mediaMime = resolvedMime;
             androidx.media3.extractor.DefaultExtractorsFactory extractors =
                     new androidx.media3.extractor.DefaultExtractorsFactory()

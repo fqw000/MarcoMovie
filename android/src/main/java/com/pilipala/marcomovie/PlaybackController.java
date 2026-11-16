@@ -1220,6 +1220,13 @@ final class PlaybackController {
                                                                         String.valueOf(text);
                                                             }
                                                         });
+                                                ready.setOnAdFilteredListener(
+                                                        total -> {
+                                                            if (ticket == a.generation
+                                                                    && !a.isFinishing()) {
+                                                                a.toast("已过滤 " + total + " 段广告");
+                                                            }
+                                                        });
                                                 ready.setOnHdrChangedListener(
                                                         hdr -> {
                                                             if (ticket != a.generation
