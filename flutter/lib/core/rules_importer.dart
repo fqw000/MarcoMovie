@@ -1,5 +1,7 @@
 import 'dart:convert';
 
+import 'ad_filter_rules.dart';
+
 /// Converts third-party rule sources (TVBox `XC.json`, anti-AD hosts lists, and
 /// m3u8-proxy-style regex rule sets) into the unified internal `AdFilterRules`
 /// JSON schema.
