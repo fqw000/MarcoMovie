@@ -91,12 +91,14 @@ final class HeuristicAdDetector {
         Map<String, Integer> counts = new HashMap<>();
         for (M3u8AdFilter.Segment segment : segments) {
             if (segment.uri == null || segment.uri.isEmpty()) continue;
-            counts.put(segment.uri, counts.getOrDefault(segment.uri, 0) + 1);
+            Integer seen = counts.get(segment.uri);
+            counts.put(segment.uri, (seen == null ? 0 : seen) + 1);
         }
         if (counts.size() <= 1) return remove;
         for (int i = 0; i < segments.size(); i++) {
             String uri = segments.get(i).uri;
-            if (uri != null && counts.getOrDefault(uri, 0) >= 2) remove.add(i);
+            Integer seen = uri == null ? null : counts.get(uri);
+            if (seen != null && seen >= 2) remove.add(i);
         }
         return remove;
     }
@@ -147,7 +149,8 @@ final class HeuristicAdDetector {
         for (M3u8AdFilter.Segment segment : segments) {
             String prefix = urlPrefix(segment.uri);
             if (prefix == null || prefix.isEmpty()) continue;
-            prefixes.put(prefix, prefixes.getOrDefault(prefix, 0) + 1);
+            Integer seen = prefixes.get(prefix);
+            prefixes.put(prefix, (seen == null ? 0 : seen) + 1);
         }
         String best = null;
         int bestCount = 0;

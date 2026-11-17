@@ -2594,7 +2594,7 @@ public final class Cms {
                             String epName = Json.str(ep, "name", "正片");
                             segs.add(epName + "$" + epUrl);
                         }
-                        u = String.join("#", segs);
+                        u = joinText("#", segs);
                     }
                     if (u.isEmpty()) continue;
                     JSONObject pInfo = p.optJSONObject("player_info");
@@ -2608,8 +2608,8 @@ public final class Cms {
                     urls.add(u);
                 }
                 if (!froms.isEmpty()) {
-                    rawFrom = String.join("$$$", froms);
-                    rawUrl = String.join("$$$", urls);
+                    rawFrom = joinText("$$$", froms);
+                    rawUrl = joinText("$$$", urls);
                 }
             }
         }
@@ -2780,6 +2780,16 @@ public final class Cms {
             return (HttpURLConnection) url.openConnection(Proxy.NO_PROXY);
         }
         return (HttpURLConnection) url.openConnection();
+    }
+
+    /** {@code String.join} requires API 26; keep Android 6 (API 23) playback working. */
+    private static String joinText(String delimiter, List<String> items) {
+        StringBuilder out = new StringBuilder();
+        for (String item : items) {
+            if (out.length() > 0) out.append(delimiter);
+            out.append(item);
+        }
+        return out.toString();
     }
 
     public static void assertMedia(String address, Map<String, String> headers) throws Exception {

@@ -138,7 +138,7 @@ final class SettingsScreen {
     }
 
     void showAdFilterRulesDialog() {
-        String[] labels = {"恢复内置规则", "从剪贴板导入"};
+        String[] labels = {"恢复内置规则", "从剪贴板导入", "从局域网/扫码输入", "查看/编辑规则"};
         if (!a.isTvDevice()) {
             MobileShell.showDrawerPicker(
                     a, "去广告规则", adFilterRuleSummary(), labels, -1, this::handleAdFilterImport);
@@ -160,7 +160,93 @@ final class SettingsScreen {
         }
         if (which == 1) {
             importAdFilterFromClipboard();
+            return;
         }
+        if (which == 2) {
+            importAdFilterViaLan();
+            return;
+        }
+        if (which == 3) {
+            showAdFilterRulesEditor();
+        }
+    }
+
+    private void importAdFilterViaLan() {
+        if (!a.isTvDevice()) {
+            showAdFilterRulesEditor();
+            return;
+        }
+        try {
+            if (a.phoneConfig != null) a.phoneConfig.close();
+            a.phoneConfig = new PhoneConfigDialog(a);
+            a.phoneConfig.showAdFilterReceiver(a::refresh);
+        } catch (Exception error) {
+            a.toast("无法获取本机局域网地址，请确认已连接 Wi-Fi 或有线局域网");
+        }
+    }
+
+    private static final String AD_FILTER_SPEC =
+            "规则格式（JSON，本说明仅为参考，保存时以实际 JSON 为准）：\n"
+                    + "· playlistRules：全局分片规则 [{type:\"regex\"|\"keyword\", pattern:\"...\"}]\n"
+                    + "· hostRules：按域名生效 [{host, regex:[], keywords:[]}]\n"
+                    + "· blockedDomains：拦截域名列表（含子域）\n"
+                    + "· blockedUrlPatterns：按完整请求 URL 的正则拦截\n"
+                    + "· heuristics：{enabled, minAdBlockDurationSec, maxAdBlockDurationSec, minAdBlockSegments}\n\n"
+                    + "也可粘贴 TVBox XC.json / anti-AD 域名 / m3u8-proxy 规则，保存时自动转换。";
+
+    void showAdFilterRulesEditor() {
+        String stored = a.prefs.getString(Prefs.AD_FILTER_RULES_JSON, "");
+        boolean custom = stored != null && !stored.trim().isEmpty();
+        String json = custom ? stored : BuiltinAdRules.json(a);
+        if (json == null || json.trim().isEmpty()) json = "{}";
+        if (a.isTvDevice()) {
+            new AppDialog.Builder(a)
+                    .setTitle(custom ? "查看去广告规则（自定义）" : "查看去广告规则（内置）")
+                    .setMessage(json)
+                    .setNeutralButton("从手机输入", (d, w) -> importAdFilterViaLan())
+                    .setNegativeButton("关闭", null)
+                    .show();
+            return;
+        }
+        final android.widget.EditText input = new android.widget.EditText(a);
+        input.setText(json);
+        input.setSingleLine(false);
+        input.setGravity(android.view.Gravity.TOP);
+        input.setTextIsSelectable(true);
+        input.setTextColor(MainActivity.WHITE);
+        input.setTextSize(13);
+        input.setBackground(a.bg(0xff1e2623, 12));
+        input.setPadding(a.dp(12), a.dp(12), a.dp(12), a.dp(12));
+        TextView spec = a.text(AD_FILTER_SPEC, 12, MainActivity.MUTED);
+        spec.setLineSpacing(a.dp(2), 1f);
+        android.widget.LinearLayout body = a.vertical();
+        body.addView(spec);
+        a.gap(body, 8);
+        body.addView(input, new LinearLayout.LayoutParams(-1, a.dp(240)));
+        new AppDialog.Builder(a)
+                .setTitle("查看/编辑去广告规则")
+                .setView(body)
+                .setNeutralButton(
+                        "恢复内置",
+                        (d, w) -> {
+                            a.prefs.edit().remove(Prefs.AD_FILTER_RULES_JSON).apply();
+                            a.toast("已恢复内置去广告规则");
+                            a.refresh();
+                        })
+                .setNegativeButton("取消", null)
+                .setPositiveButton(
+                        "保存",
+                        (d, w) -> {
+                            String converted = importAdFilterText(input.getText().toString());
+                            if (converted == null) {
+                                a.toast("未识别的规则格式");
+                                return;
+                            }
+                            a.prefs.edit().putString(Prefs.AD_FILTER_RULES_JSON, converted).apply();
+                            a.toast("已保存去广告规则");
+                            a.refresh();
+                        })
+                .show();
     }
 
     private void importAdFilterFromClipboard() {
@@ -186,7 +272,7 @@ final class SettingsScreen {
         a.refresh();
     }
 
-    private static String importAdFilterText(String text) {
+    static String importAdFilterText(String text) {
         String trimmed = text.trim();
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             if (AdFilterRules.parse(trimmed).hasAnyRule()) return trimmed;

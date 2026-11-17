@@ -14,6 +14,7 @@ import com.google.zxing.qrcode.QRCodeWriter;
 final class PhoneConfigDialog {
     final MainActivity a;
     ConfigTransferServer server;
+    AdFilterInputServer adFilterServer;
     AppDialog dialog;
     boolean finished;
     final Runnable expiry = this::expire;
@@ -255,9 +256,96 @@ final class PhoneConfigDialog {
         }
     }
 
+    void showAdFilterReceiver(final Runnable onImported) {
+        try {
+            String ip = lanAddress();
+            adFilterServer =
+                    new AdFilterInputServer(
+                            text -> {
+                                String converted = SettingsScreen.importAdFilterText(text);
+                                if (converted == null) {
+                                    throw new java.io.IOException("未识别的规则格式");
+                                }
+                                a.ui.post(
+                                        () -> {
+                                            if (a.isFinishing() || a.phoneConfig != this) return;
+                                            a.prefs
+                                                    .edit()
+                                                    .putString(
+                                                            Prefs.AD_FILTER_RULES_JSON, converted)
+                                                    .apply();
+                                            finished = true;
+                                            if (dialog != null) dialog.dismiss();
+                                            if (onImported != null) onImported.run();
+                                        });
+                            });
+            final String address = adFilterServer.address(ip);
+            LinearLayout panel = a.vertical();
+            panel.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+            TextView note =
+                    a.text(
+                            "手机与电视连接同一网络后扫码，在手机页面粘贴去广告规则（TVBox XC.json / anti-AD 域名 / m3u8-proxy 规则 / 本应用规则 JSON）并发送。",
+                            13.5f,
+                            MainActivity.MUTED);
+            note.setLineSpacing(a.dp(3), 1f);
+            panel.addView(note);
+            a.gap(panel, 12);
+            int qrSize = a.dp(186);
+            BitMatrix matrix =
+                    new QRCodeWriter().encode(address, BarcodeFormat.QR_CODE, qrSize, qrSize);
+            int[] pixels = new int[qrSize * qrSize];
+            for (int y = 0; y < qrSize; y++)
+                for (int x = 0; x < qrSize; x++)
+                    pixels[y * qrSize + x] = matrix.get(x, y) ? Color.BLACK : Color.WHITE;
+            ImageView qr = new ImageView(a);
+            qr.setTag("adfilter-qr");
+            qr.setContentDescription("手机输入去广告规则二维码");
+            qr.setImageBitmap(Bitmap.createBitmap(pixels, qrSize, qrSize, Bitmap.Config.ARGB_8888));
+            panel.addView(qr, new LinearLayout.LayoutParams(qrSize, qrSize));
+            TextView url = a.text(address, 12.5f, 0xff5ac8fa);
+            url.setTag("adfilter-address");
+            url.setGravity(android.view.Gravity.CENTER);
+            url.setPadding(0, a.dp(10), 0, 0);
+            panel.addView(url);
+            a.gap(panel, 6);
+            panel.addView(a.text("输入码有效 5 分钟 · 关闭窗口即停止监听", 12, MainActivity.MUTED));
+            dialog =
+                    new AppDialog.Builder(a)
+                            .setTitle("手机输入去广告规则")
+                            .setView(panel)
+                            .setNeutralButton(
+                                    "遥控输入",
+                                    (d, n) -> new SettingsScreen(a).showAdFilterRulesEditor())
+                            .setPositiveButton(
+                                    "刷新二维码",
+                                    (d, n) -> {
+                                        if (a.phoneConfig != null) a.phoneConfig.close();
+                                        a.phoneConfig = new PhoneConfigDialog(a);
+                                        a.phoneConfig.showAdFilterReceiver(onImported);
+                                    })
+                            .setNegativeButton("完成并关闭", null)
+                            .create();
+            dialog.setOnDismissListener(
+                    d -> {
+                        a.ui.removeCallbacks(expiry);
+                        if (finished) a.ui.postDelayed(this::close, 1500);
+                        else close();
+                    });
+            dialog.show();
+            if (a.isTvDevice() && dialog.getButton(-2) != null) {
+                dialog.getButton(-2).requestFocus();
+            }
+            a.ui.postDelayed(expiry, TimeUnit.MINUTES.toMillis(5));
+        } catch (Exception error) {
+            close();
+            a.toast("无法获取本机局域网地址，请确认已连接 Wi-Fi 或有线局域网");
+        }
+    }
+
     void close() {
         a.ui.removeCallbacks(expiry);
         if (server != null) server.close();
+        if (adFilterServer != null) adFilterServer.close();
         if (a.phoneConfig == this) a.phoneConfig = null;
     }
 }
