@@ -85,6 +85,8 @@ class StorageService {
   static const String keySyncLastStatus = 'sync_last_status';
   static const String keyVideoSkipRecords = 'video_skip_records';
   static const String keyPlayerAlwaysShowClock = 'player_always_show_clock';
+  static const String keyAdFilterEnabled = 'ad_filter_enabled';
+  static const String keyAdFilterRulesJson = 'ad_filter_rules_json';
   static const int maxVideoSkipRecords = 500;
   static const String _subscriptionsFileName = 'subscriptions.json';
   static const String _watchHistoryFileName = 'watch_history.json';
@@ -666,6 +668,8 @@ class StorageService {
   int get skipOutroSec => (_prefs.getInt(keySkipOutroSec) ?? 0).clamp(0, 600);
   bool get playerAlwaysShowClock =>
       _prefs.getBool(keyPlayerAlwaysShowClock) ?? false;
+  bool get adFilterEnabled => _prefs.getBool(keyAdFilterEnabled) ?? true;
+  String get adFilterRulesJson => _prefs.getString(keyAdFilterRulesJson) ?? '';
   String get repeatMode => _prefs.getString(keyRepeatMode) ?? 'off';
   String get wallpaperPreset =>
       _prefs.getString(keyWallpaperPreset) ?? 'obsidian';
@@ -1959,6 +1963,12 @@ class StorageService {
   }
   Future<void> setPlayerAlwaysShowClock(bool value) async {
     await _prefs.setBool(keyPlayerAlwaysShowClock, value);
+  }
+  Future<void> setAdFilterEnabled(bool value) async {
+    await _prefs.setBool(keyAdFilterEnabled, value);
+  }
+  Future<void> setAdFilterRulesJson(String value) async {
+    await _prefs.setString(keyAdFilterRulesJson, value);
   }
   static String _videoSkipKey(String siteKey, String videoId) {
     final s = siteKey.trim();

@@ -54,4 +54,5 @@ flutter:
     - assets/catpaw/
     - assets/python-host/
     - assets/logo_mark.png
+    - assets/adfilter/builtin_rules.json
     - shaders/GLASSWORK-LICENSE.txt

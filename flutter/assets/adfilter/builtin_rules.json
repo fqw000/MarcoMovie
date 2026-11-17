@@ -1,0 +1,61 @@
+{
+  "_doc": [
+    "自定义去广告规则格式（本字段仅为说明，可删除，不影响功能）：",
+    "· playlistRules: 全局分片规则 [{type:\"regex\"|\"keyword\", pattern:\"...\"}]，匹配每个媒体分片的 URL",
+    "· hostRules: 按域名生效 [{host:\"...\", regex:[...], keywords:[...]}]，仅当播放列表来自该域名时匹配",
+    "· blockedDomains: [\"域名\", ...] 命中即拦截整个请求（含子域名）",
+    "· blockedUrlPatterns: [\"正则\", ...] 按完整请求 URL 拦截",
+    "· heuristics: {enabled:true, minAdBlockDurationSec:3, maxAdBlockDurationSec:75, minAdBlockSegments:2}",
+    "导入也接受：TVBox XC.json、anti-AD 域名列表、m3u8-proxy 规则"
+  ],
+  "version": 2,
+  "playlistRules": [
+    {"type": "regex", "pattern": "/ad/"},
+    {"type": "regex", "pattern": "/ads/"},
+    {"type": "regex", "pattern": "_ad_"},
+    {"type": "regex", "pattern": "_ads_"},
+    {"type": "keyword", "pattern": "sponsor"},
+    {"type": "keyword", "pattern": "promo"},
+    {"type": "keyword", "pattern": "splash"},
+    {"type": "keyword", "pattern": "vip_ad"},
+    {"type": "keyword", "pattern": "advert"},
+    {"type": "keyword", "pattern": "interstitial"}
+  ],
+  "hostRules": [],
+  "blockedDomains": [
+    "doubleclick.net",
+    "googlesyndication.com",
+    "adservice.google.com",
+    "googleadservices.com",
+    "googletagmanager.com",
+    "googletagservices.com",
+    "google-analytics.com",
+    "scorecardresearch.com",
+    "moatads.com",
+    "adsrvr.org",
+    "adnxs.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "criteo.com",
+    "criteo.net",
+    "taboola.com",
+    "outbrain.com",
+    "adform.net",
+    "advertising.com",
+    "adroll.com",
+    "casalemedia.com",
+    "quantserve.com",
+    "chartbeat.com"
+  ],
+  "blockedUrlPatterns": [],
+  "heuristics": {
+    "enabled": true,
+    "minAdBlockDurationSec": 3,
+    "maxAdBlockDurationSec": 75,
+    "minAdBlockSegments": 2,
+    "urlPrefixAnomaly": true,
+    "keyNoneSwitch": true,
+    "mirrorReuse": true
+  }
+}

@@ -7092,6 +7092,19 @@ class _AdaptiveShellState extends State<AdaptiveShell>
                   ),
                 ],
               ),
+              IosSettingsGroup(
+                header: '去广告',
+                footer: '按内置规则与启发式识别过滤 HLS 播放列表中的广告分段。',
+                children: [
+                  toggleRow(
+                    'M3U8 去广告',
+                    CupertinoIcons.shield_lefthalf_fill,
+                    AppleColors.systemGreen,
+                    storage.adFilterEnabled,
+                    storage.setAdFilterEnabled,
+                  ),
+                ],
+              ),
             ]),
           ),
           SettingsPane(

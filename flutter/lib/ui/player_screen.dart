@@ -8,6 +8,8 @@ import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import '../core/cms_client.dart';
+import '../core/ad_filter_config.dart';
+import '../core/ad_filter_rules.dart';
 import '../core/emby_library.dart';
 import '../core/csp_bridge.dart';
 import '../core/cloud_media_proxy.dart';
@@ -998,10 +1000,17 @@ class _PlayerScreenState extends State<PlayerScreen>
       if (pendingLease == null &&
           parsedTargetUri != null &&
           LocalMediaLease.shouldProxy(parsedTargetUri)) {
+        final rules = await AdFilterConfig.load(widget.storage);
         pendingLocalLease = await LocalMediaLease.open(
           target: parsedTargetUri,
           headers: headers,
           isCancelled: () => !mounted || session != _playSession,
+          rules: rules,
+          onFiltered: (total) {
+            if (mounted && session == _playSession) {
+              _showHud('已过滤 $total 段广告');
+            }
+          },
         );
       }
       if (!mounted || session != _playSession) {

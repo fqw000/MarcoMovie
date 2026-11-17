@@ -7,6 +7,9 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 
+import 'ad_filter_rules.dart';
+import 'm3u8_ad_filter.dart';
+
 enum _TargetKind { auto, playlist, tsSegment, raw }
 
 class _RegisteredTarget {
@@ -192,6 +195,8 @@ class LocalMediaLease {
     this._isCancelled,
     this._capability,
     this._clock,
+    this._rules,
+    this._onFiltered,
   )   : _initialOrigin = _originOf(initialTarget),
         _created = _clock() {
     _initialUrl = _register(initialTarget, _inferInitialKind(initialTarget));
@@ -238,6 +243,8 @@ class LocalMediaLease {
   final String _capability;
   final DateTime Function() _clock;
   final DateTime _created;
+  final AdFilterRules? _rules;
+  final void Function(int totalRemoved)? _onFiltered;
   final _cookieJar = _SessionCookieJar();
   final _targets = <String, _RegisteredTarget>{};
   final _paths = <String, String>{};
@@ -247,6 +254,7 @@ class LocalMediaLease {
   http.Client? _directOnlyClient;
   Timer? _timer;
   bool _closed = false;
+  int _filteredTotal = 0;
 
   Uri get url => _initialUrl;
   bool get isClosed => _closed;
@@ -389,6 +397,8 @@ class LocalMediaLease {
     required bool Function() isCancelled,
     DateTime Function()? clock,
     http.Client? client,
+    AdFilterRules? rules,
+    void Function(int totalRemoved)? onFiltered,
   }) async {
     if (!shouldProxy(target)) {
       throw const FormatException('本地媒体代理仅接受远程 HTTP/HTTPS 流地址');
@@ -425,6 +435,8 @@ class LocalMediaLease {
       isCancelled,
       capability,
       clock ?? DateTime.now,
+      rules,
+      onFiltered,
     );
   }
 
@@ -722,6 +734,14 @@ class LocalMediaLease {
       await request.response.close();
       return;
     }
+    final rules = _rules;
+    if (rules != null &&
+        (rules.isBlockedUrl(registered.uri.toString()) ||
+            rules.isBlockedHost(registered.uri.host))) {
+      request.response.statusCode = HttpStatus.forbidden;
+      await request.response.close();
+      return;
+    }
     if (request.method != 'GET' && request.method != 'HEAD') {
       request.response.statusCode = HttpStatus.methodNotAllowed;
       await request.response.close();
@@ -859,7 +879,18 @@ class LocalMediaLease {
 
   Future<void> _respondPlaylist(
       HttpResponse downstream, String playlistText, Uri playlistOrigin) async {
-    final rewritten = _rewritePlaylist(playlistText, playlistOrigin);
+    var filteredText = playlistText;
+    final rules = _rules;
+    if (rules != null) {
+      final result =
+          M3u8AdFilter.filter(playlistText, playlistOrigin.host, rules);
+      filteredText = result.text;
+      if (result.removedSegments > 0) {
+        _filteredTotal += result.removedSegments;
+        _onFiltered?.call(_filteredTotal);
+      }
+    }
+    final rewritten = _rewritePlaylist(filteredText, playlistOrigin);
     final encoded = utf8.encode(rewritten);
     downstream.statusCode = HttpStatus.ok;
     downstream.headers.removeAll('content-range');
