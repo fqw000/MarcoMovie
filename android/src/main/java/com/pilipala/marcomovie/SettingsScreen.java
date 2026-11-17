@@ -222,9 +222,7 @@ final class SettingsScreen {
                 .setView(body)
                 .setNeutralButton("选择本地文件", (d, w) -> pickAdFilterRuleFile())
                 .setNegativeButton("取消", null)
-                .setPositiveButton(
-                        "保存",
-                        (d, w) -> saveAdFilterRules(input.getText().toString()))
+                .setPositiveButton("保存", (d, w) -> saveAdFilterRules(input.getText().toString()))
                 .show();
     }
 
@@ -1285,7 +1283,8 @@ final class SettingsScreen {
                                     a.ui.post(() -> a.toast("未识别的规则格式"));
                                     return;
                                 }
-                                a.prefs.edit()
+                                a.prefs
+                                        .edit()
                                         .putString(Prefs.AD_FILTER_RULES_JSON, converted)
                                         .apply();
                                 a.ui.post(

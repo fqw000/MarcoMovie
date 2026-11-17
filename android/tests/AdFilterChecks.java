@@ -131,10 +131,11 @@ public final class AdFilterChecks {
         for (int i = 50; i < 100; i++) {
             playlist.append("#EXTINF:10.0,\n").append("s").append(i).append(".ts\n");
         }
-        AdFilterRules rules =
-                AdFilterRules.parse("{\"heuristics\":{\"enabled\":true}}");
+        AdFilterRules rules = AdFilterRules.parse("{\"heuristics\":{\"enabled\":true}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist.toString(), "host", rules);
-        check(result.removedSegments == 0, "default heuristics leave variable-duration content intact");
+        check(
+                result.removedSegments == 0,
+                "default heuristics leave variable-duration content intact");
     }
 
     private static void checkDurationWindowHeuristic() {
@@ -199,11 +200,12 @@ public final class AdFilterChecks {
                         + "#EXTINF:10.0,\n"
                         + "c3.ts\n";
         AdFilterRules rules =
-                AdFilterRules.parse(
-                        "{\"heuristics\":{\"enabled\":true,\"mirrorReuse\":true}}");
+                AdFilterRules.parse("{\"heuristics\":{\"enabled\":true,\"mirrorReuse\":true}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
         check(result.removedSegments == 3, "opt-in mirror reuse removes repeated ad-loop URI");
-        check(result.text.contains("c1.ts") && result.text.contains("c2.ts"), "mirror reuse keeps unique segments");
+        check(
+                result.text.contains("c1.ts") && result.text.contains("c2.ts"),
+                "mirror reuse keeps unique segments");
     }
 
     private static void checkUrlPrefixHeuristic() {
@@ -222,9 +224,7 @@ public final class AdFilterChecks {
                         "{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2,\"urlPrefixAnomaly\":true}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
         check(result.removedSegments == 2, "host anomaly removes off-host ad block");
-        check(
-                result.text.contains("cdn.test"),
-                "host anomaly keeps dominant host segments");
+        check(result.text.contains("cdn.test"), "host anomaly keeps dominant host segments");
     }
 
     private static void checkRulesImporters() {
@@ -266,24 +266,18 @@ public final class AdFilterChecks {
                 AdFilterRules.parse(
                         "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"custom_ad\"}]}");
         AdFilterRules merged = AdFilterRules.merge(base, customNoHeu);
-        check(
-                merged.globalKeywords.size() == 2,
-                "merge unions builtin and custom keywords");
+        check(merged.globalKeywords.size() == 2, "merge unions builtin and custom keywords");
         check(
                 merged.heuristics.enabled && merged.heuristics.keyNoneSwitch,
                 "merge keeps builtin heuristics when custom omits them");
 
-        AdFilterRules customHeu =
-                AdFilterRules.parse(
-                        "{\"heuristics\":{\"enabled\":false}}");
+        AdFilterRules customHeu = AdFilterRules.parse("{\"heuristics\":{\"enabled\":false}}");
         AdFilterRules merged2 = AdFilterRules.merge(base, customHeu);
         check(
                 !merged2.heuristics.enabled,
                 "merge uses custom heuristics when explicitly specified");
 
         AdFilterRules customOnly = AdFilterRules.merge(AdFilterRules.empty(), customNoHeu);
-        check(
-                customOnly.globalKeywords.size() == 1,
-                "merge with empty base keeps custom rules");
+        check(customOnly.globalKeywords.size() == 1, "merge with empty base keeps custom rules");
     }
 }

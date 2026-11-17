@@ -97,11 +97,12 @@ final class AdFilterRules {
      * the custom JSON actually specified a {@code heuristics} block.
      */
     static AdFilterRules merge(AdFilterRules base, AdFilterRules custom) {
-        if (base == null || (base.globalRegex.isEmpty()
-                && base.globalKeywords.isEmpty()
-                && base.hostRules.isEmpty()
-                && base.blockedDomains.isEmpty()
-                && base.blockedUrlPatterns.isEmpty())) {
+        if (base == null
+                || (base.globalRegex.isEmpty()
+                        && base.globalKeywords.isEmpty()
+                        && base.hostRules.isEmpty()
+                        && base.blockedDomains.isEmpty()
+                        && base.blockedUrlPatterns.isEmpty())) {
             return custom == null ? empty() : custom;
         }
         if (custom == null) return base;

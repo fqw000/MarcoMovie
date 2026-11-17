@@ -82,8 +82,8 @@ final class HeuristicAdDetector {
                 continue;
             }
             int end = start;
-            while (end < segments.size()
-                    && !dominantHost.equals(hostOf(segments.get(end).uri))) end++;
+            while (end < segments.size() && !dominantHost.equals(hostOf(segments.get(end).uri)))
+                end++;
             int length = end - start;
             boolean boundedLeft =
                     start > 0 && dominantHost.equals(hostOf(segments.get(start - 1).uri));
@@ -147,8 +147,7 @@ final class HeuristicAdDetector {
             while (end < segments.size() && isAdLikeDuration(segments.get(end), cfg)) end++;
             int length = end - start;
             boolean boundedLeft = start > 0 && isLongContent(segments.get(start - 1), cfg);
-            boolean boundedRight =
-                    end < segments.size() && isLongContent(segments.get(end), cfg);
+            boolean boundedRight = end < segments.size() && isLongContent(segments.get(end), cfg);
             boolean noDiscontinuity = true;
             for (int i = start; i < end; i++) {
                 if (segments.get(i).discontinuityBefore > 0) {
