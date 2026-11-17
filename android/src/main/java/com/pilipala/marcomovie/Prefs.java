@@ -58,6 +58,7 @@ final class Prefs {
     static final String SEARCH_TIMEOUT = "search_timeout";
     static final String EPISODES_DESCENDING = "episodes_descending";
     static final String AD_FILTER_ENABLED = "ad_filter_enabled";
+    static final String USE_BUILTIN_RULES = "use_builtin_rules";
 
     // Runtime state & user data keys (excluded from settings-only reset/restore).
     static final String ORIGIN = "origin";
@@ -139,7 +140,8 @@ final class Prefs {
         SEARCH_THREADS,
         SEARCH_TIMEOUT,
         EPISODES_DESCENDING,
-        AD_FILTER_ENABLED
+        AD_FILTER_ENABLED,
+        USE_BUILTIN_RULES
     };
 
     private static final Set<String> BOOLEAN_KEYS =
@@ -158,7 +160,8 @@ final class Prefs {
                                     PREFER_AAC,
                                     TUNNELED_PLAYBACK,
                                     EPISODES_DESCENDING,
-                                    AD_FILTER_ENABLED)));
+                                    AD_FILTER_ENABLED,
+                                    USE_BUILTIN_RULES)));
 
     private static final Map<String, int[]> INT_RANGES;
 
@@ -329,6 +332,9 @@ final class Prefs {
             if (text.isEmpty()) return "[]";
             if (text.startsWith("[") && text.endsWith("]")) return text;
             return null;
+        }
+        if (AD_FILTER_RULES_JSON.equals(key)) {
+            return text.length() <= 262144 ? text : null;
         }
         return null;
     }

@@ -6,6 +6,7 @@ class Segment {
   double durationSec = 0.0;
   String? keyMethod; // null = no KEY seen, "NONE", or e.g. "AES-128"
   int discontinuityBefore = 0; // #EXT-X-DISCONTINUITY markers since previous segment
+  bool scteAd = false; // inside a #EXT-X-CUE-OUT/IN or SCTE-35 marked ad break
   int extinfLine = 0;
   int uriLine = 0;
   bool removed = false;
@@ -41,12 +42,12 @@ class M3u8AdFilter {
 
     final encrypted = _isEncrypted(segments);
 
-    // Rule-based removal is only safe for clear streams: deleting a segment in
-    // the middle of an AES-128 stream shifts the implicit IV of every following
-    // segment and breaks decryption.
+    // Rule-based and SCTE/CUE removal are only safe for clear streams: deleting
+    // a segment in the middle of an AES-128 stream shifts the implicit IV of
+    // every following segment and breaks decryption.
     if (!encrypted) {
       for (final segment in segments) {
-        if (rules.matchesSegment(playlistHost, segment.uri)) {
+        if (segment.scteAd || rules.matchesSegment(playlistHost, segment.uri)) {
           segment.removed = true;
         }
       }
@@ -103,6 +104,7 @@ class M3u8AdFilter {
     final segments = <Segment>[];
     String? currentKey;
     var pendingDiscontinuity = 0;
+    var inScteAd = false;
     for (var i = 1; i < lines.length; i++) {
       final trimmed = lines[i].trim();
       if (trimmed.startsWith('#EXT-X-KEY:')) {
@@ -111,6 +113,14 @@ class M3u8AdFilter {
       }
       if (trimmed.startsWith('#EXT-X-DISCONTINUITY')) {
         pendingDiscontinuity++;
+        continue;
+      }
+      if (_isScteAdStart(trimmed)) {
+        inScteAd = true;
+        continue;
+      }
+      if (trimmed.startsWith('#EXT-X-CUE-IN')) {
+        inScteAd = false;
         continue;
       }
       if (!trimmed.startsWith('#EXTINF:')) continue;
@@ -129,11 +139,23 @@ class M3u8AdFilter {
       segment.durationSec = _parseDuration(trimmed);
       segment.keyMethod = currentKey;
       segment.discontinuityBefore = pendingDiscontinuity;
+      segment.scteAd = inScteAd;
       pendingDiscontinuity = 0;
       segments.add(segment);
       i = uriLine;
     }
     return segments;
+  }
+
+  /// Industry-standard ad-break markers: CUE-OUT/IN and the SCTE-35 family.
+  static bool _isScteAdStart(String line) {
+    if (line.startsWith('#EXT-X-CUE-OUT') ||
+        line.startsWith('#EXT-X-SCTE35') ||
+        line.startsWith('#EXT-OATCLS-SCTE35')) {
+      return true;
+    }
+    return line.startsWith('#EXT-X-DATERANGE') &&
+        line.toUpperCase().contains('SCTE35');
   }
 
   static String? _parseKeyMethod(String keyLine) {
@@ -230,12 +252,14 @@ class HeuristicAdDetector {
       return remove;
     }
     if (cfg.urlPrefixAnomaly) {
-      remove.addAll(_detectUrlPrefixAnomaly(segments, cfg));
+      remove.addAll(_detectHostAnomaly(segments, cfg));
     }
     if (cfg.mirrorReuse) {
-      remove.addAll(_detectMirrorReuse(segments));
+      remove.addAll(_detectMirrorReuse(segments, cfg));
     }
-    remove.addAll(_detectDurationWindows(segments, cfg));
+    if (cfg.durationWindows) {
+      remove.addAll(_detectDurationWindows(segments, cfg));
+    }
     return remove;
   }
 
@@ -261,7 +285,9 @@ class HeuristicAdDetector {
       final length = end - start;
       final boundedLeft = start > 0 && !_isClear(segments[start - 1]);
       final boundedRight = end < segments.length && !_isClear(segments[end]);
-      if (length >= cfg.minAdBlockSegments && (boundedLeft || boundedRight)) {
+      if (length >= cfg.minAdBlockSegments &&
+          length <= cfg.maxAdBlockSegments &&
+          (boundedLeft || boundedRight)) {
         for (var i = start; i < end; i++) {
           remove.add(i);
         }
@@ -271,29 +297,33 @@ class HeuristicAdDetector {
     return remove;
   }
 
-  /// Removes contiguous runs whose URL prefix diverges from the playlist's
-  /// dominant prefix.
-  static Set<int> _detectUrlPrefixAnomaly(
+  /// Removes short contiguous runs served from a different host than the
+  /// playlist's dominant host, only when the run is bounded on both sides by the
+  /// dominant host (classic ad-CD insert).
+  static Set<int> _detectHostAnomaly(
       List<Segment> segments, Heuristics cfg) {
     final remove = <int>{};
-    final prefix = _dominantPrefix(segments);
-    if (prefix == null || prefix.isEmpty) return remove;
+    final dominant = _dominantHost(segments);
+    if (dominant == null || dominant.isEmpty) return remove;
     var start = 0;
     while (start < segments.length) {
-      if (segments[start].uri.startsWith(prefix)) {
+      if (_hostOf(segments[start].uri) == dominant) {
         start++;
         continue;
       }
       var end = start;
-      while (end < segments.length && !segments[end].uri.startsWith(prefix)) {
+      while (end < segments.length && _hostOf(segments[end].uri) != dominant) {
         end++;
       }
       final length = end - start;
       final boundedLeft =
-          start > 0 && segments[start - 1].uri.startsWith(prefix);
+          start > 0 && _hostOf(segments[start - 1].uri) == dominant;
       final boundedRight =
-          end < segments.length && segments[end].uri.startsWith(prefix);
-      if (length >= cfg.minAdBlockSegments && (boundedLeft || boundedRight)) {
+          end < segments.length && _hostOf(segments[end].uri) == dominant;
+      if (length >= cfg.minAdBlockSegments &&
+          length <= cfg.maxAdBlockSegments &&
+          boundedLeft &&
+          boundedRight) {
         for (var i = start; i < end; i++) {
           remove.add(i);
         }
@@ -303,53 +333,63 @@ class HeuristicAdDetector {
     return remove;
   }
 
-  /// Removes every occurrence of a URI that repeats across the playlist (ad
-  /// loop evidence).
-  static Set<int> _detectMirrorReuse(List<Segment> segments) {
+  /// Removes every occurrence of a URI that repeats heavily (ad-loop evidence)
+  /// while the rest of the playlist is mostly unique. Requires at least three
+  /// repeats, at least four distinct URIs, and short segment durations.
+  static Set<int> _detectMirrorReuse(
+      List<Segment> segments, Heuristics cfg) {
     final remove = <int>{};
     final counts = <String, int>{};
     for (final segment in segments) {
       if (segment.uri.isEmpty) continue;
       counts[segment.uri] = (counts[segment.uri] ?? 0) + 1;
     }
-    if (counts.length <= 1) return remove;
+    if (counts.length < 4) return remove;
     for (var i = 0; i < segments.length; i++) {
-      final uri = segments[i].uri;
-      if (uri.isNotEmpty && (counts[uri] ?? 0) >= 2) remove.add(i);
+      final segment = segments[i];
+      if (segment.uri.isEmpty) continue;
+      final seen = counts[segment.uri] ?? 0;
+      if (seen >= 3 &&
+          segment.durationSec > 0.0 &&
+          segment.durationSec <= cfg.maxAdBlockDurationSec) {
+        remove.add(i);
+      }
     }
     return remove;
   }
 
-  /// Removes isolated windows of short-duration segments sandwiched between
-  /// longer content.
+  /// Removes a short, uniformly-timed block of segments that is bounded on both
+  /// sides by clearly longer content, with no discontinuity inside. Disabled by
+  /// default: segment duration alone is an unreliable ad signal in HLS.
   static Set<int> _detectDurationWindows(
       List<Segment> segments, Heuristics cfg) {
     final remove = <int>{};
-    var contentDuration = 0.0;
-    for (final segment in segments) {
-      if (segment.durationSec > contentDuration) {
-        contentDuration = segment.durationSec;
-      }
-    }
-    if (contentDuration <= 0.0) return remove;
     var start = 0;
     while (start < segments.length) {
-      if (!_isAdLikeDuration(segments[start], cfg, contentDuration)) {
+      if (!_isAdLikeDuration(segments[start], cfg)) {
         start++;
         continue;
       }
       var end = start;
-      while (end < segments.length &&
-          _isAdLikeDuration(segments[end], cfg, contentDuration)) {
+      while (end < segments.length && _isAdLikeDuration(segments[end], cfg)) {
         end++;
       }
       final length = end - start;
-      final boundedContentLeft = start > 0 &&
-          !_isAdLikeDuration(segments[start - 1], cfg, contentDuration);
-      final boundedContentRight = end < segments.length &&
-          !_isAdLikeDuration(segments[end], cfg, contentDuration);
+      final boundedLeft = start > 0 && _isLongContent(segments[start - 1], cfg);
+      final boundedRight =
+          end < segments.length && _isLongContent(segments[end], cfg);
+      var noDiscontinuity = true;
+      for (var i = start; i < end; i++) {
+        if (segments[i].discontinuityBefore > 0) {
+          noDiscontinuity = false;
+          break;
+        }
+      }
       if (length >= cfg.minAdBlockSegments &&
-          (boundedContentLeft || boundedContentRight)) {
+          length <= cfg.maxAdBlockSegments &&
+          boundedLeft &&
+          boundedRight &&
+          noDiscontinuity) {
         for (var i = start; i < end; i++) {
           remove.add(i);
         }
@@ -359,25 +399,26 @@ class HeuristicAdDetector {
     return remove;
   }
 
-  static bool _isAdLikeDuration(
-      Segment segment, Heuristics cfg, double contentDuration) {
+  static bool _isAdLikeDuration(Segment segment, Heuristics cfg) {
     final duration = segment.durationSec;
-    return duration > 0.0 &&
-        duration >= cfg.minAdBlockDurationSec &&
-        duration <= cfg.maxAdBlockDurationSec &&
-        duration < contentDuration;
+    return duration >= cfg.minAdBlockDurationSec &&
+        duration <= cfg.maxAdBlockDurationSec;
   }
 
-  static String? _dominantPrefix(List<Segment> segments) {
-    final prefixes = <String, int>{};
+  static bool _isLongContent(Segment segment, Heuristics cfg) {
+    return segment.durationSec > cfg.maxAdBlockDurationSec;
+  }
+
+  static String? _dominantHost(List<Segment> segments) {
+    final hosts = <String, int>{};
     for (final segment in segments) {
-      final prefix = _urlPrefix(segment.uri);
-      if (prefix == null || prefix.isEmpty) continue;
-      prefixes[prefix] = (prefixes[prefix] ?? 0) + 1;
+      final host = _hostOf(segment.uri);
+      if (host == null || host.isEmpty) continue;
+      hosts[host] = (hosts[host] ?? 0) + 1;
     }
     String? best;
     var bestCount = 0;
-    for (final entry in prefixes.entries) {
+    for (final entry in hosts.entries) {
       if (entry.value > bestCount) {
         best = entry.key;
         bestCount = entry.value;
@@ -386,9 +427,16 @@ class HeuristicAdDetector {
     return best;
   }
 
-  static String? _urlPrefix(String uri) {
-    final slash = uri.lastIndexOf('/');
-    if (slash < 0) return null;
-    return uri.substring(0, slash + 1);
+  static String? _hostOf(String uri) {
+    final scheme = uri.indexOf('://');
+    final start = scheme >= 0 ? scheme + 3 : 0;
+    var end = start;
+    while (end < uri.length) {
+      final c = uri.codeUnitAt(end);
+      if (c == 0x2F || c == 0x3F || c == 0x23 || c == 0x3A) break;
+      end++;
+    }
+    final host = uri.substring(start, end).trim();
+    return host.isEmpty ? null : host.toLowerCase();
   }
 }

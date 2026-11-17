@@ -23,12 +23,14 @@ class HostRule {
 /// Heuristic configuration. Mirrors the Java nested `AdFilterRules.Heuristics`.
 class Heuristics {
   bool enabled = false;
-  int minAdBlockDurationSec = 3;
-  int maxAdBlockDurationSec = 75;
+  int minAdBlockDurationSec = 4;
+  int maxAdBlockDurationSec = 30;
   int minAdBlockSegments = 2;
-  bool urlPrefixAnomaly = true;
+  int maxAdBlockSegments = 8;
+  bool urlPrefixAnomaly = false;
   bool keyNoneSwitch = true;
-  bool mirrorReuse = true;
+  bool mirrorReuse = false;
+  bool durationWindows = false;
 }
 
 /// Ad-filter rule model for HLS playlist and request filtering.
@@ -39,6 +41,7 @@ class AdFilterRules {
   final Set<String> blockedDomains;
   final List<RegExp> blockedUrlPatterns;
   final Heuristics heuristics;
+  final bool heuristicsSpecified;
 
   AdFilterRules._(
       this.globalRegex,
@@ -46,7 +49,8 @@ class AdFilterRules {
       this.hostRules,
       this.blockedDomains,
       this.blockedUrlPatterns,
-      this.heuristics);
+      this.heuristics,
+      this.heuristicsSpecified);
 
   static AdFilterRules empty() {
     return AdFilterRules._(
@@ -55,7 +59,26 @@ class AdFilterRules {
         const <HostRule>[],
         <String>{},
         const <RegExp>[],
-        Heuristics());
+        Heuristics(),
+        false);
+  }
+
+  /// Combines a base rule set (typically built-in) with a custom rule set.
+  static AdFilterRules merge(AdFilterRules base, AdFilterRules custom) {
+    final baseEmpty = base.globalRegex.isEmpty &&
+        base.globalKeywords.isEmpty &&
+        base.hostRules.isEmpty &&
+        base.blockedDomains.isEmpty &&
+        base.blockedUrlPatterns.isEmpty;
+    if (baseEmpty) return custom;
+    return AdFilterRules._(
+        <RegExp>[...base.globalRegex, ...custom.globalRegex],
+        <String>[...base.globalKeywords, ...custom.globalKeywords],
+        <HostRule>[...base.hostRules, ...custom.hostRules],
+        <String>{...base.blockedDomains, ...custom.blockedDomains},
+        <RegExp>[...base.blockedUrlPatterns, ...custom.blockedUrlPatterns],
+        custom.heuristicsSpecified ? custom.heuristics : base.heuristics,
+        base.heuristicsSpecified || custom.heuristicsSpecified);
   }
 
   /// Parses the internal schema. Returns an empty rule set on malformed JSON.
@@ -134,17 +157,19 @@ class AdFilterRules {
       if (heu is Map<String, dynamic>) {
         heuristics.enabled = _optBool(heu, 'enabled', false);
         heuristics.minAdBlockDurationSec =
-            _optInt(heu, 'minAdBlockDurationSec', 3);
+            _optInt(heu, 'minAdBlockDurationSec', 4);
         heuristics.maxAdBlockDurationSec =
-            _optInt(heu, 'maxAdBlockDurationSec', 75);
+            _optInt(heu, 'maxAdBlockDurationSec', 30);
         heuristics.minAdBlockSegments = _optInt(heu, 'minAdBlockSegments', 2);
-        heuristics.urlPrefixAnomaly = _optBool(heu, 'urlPrefixAnomaly', true);
+        heuristics.maxAdBlockSegments = _optInt(heu, 'maxAdBlockSegments', 8);
+        heuristics.urlPrefixAnomaly = _optBool(heu, 'urlPrefixAnomaly', false);
         heuristics.keyNoneSwitch = _optBool(heu, 'keyNoneSwitch', true);
-        heuristics.mirrorReuse = _optBool(heu, 'mirrorReuse', true);
+        heuristics.mirrorReuse = _optBool(heu, 'mirrorReuse', false);
+        heuristics.durationWindows = _optBool(heu, 'durationWindows', false);
       }
 
       return AdFilterRules._(globalRegex, globalKeywords, hostRules, domains,
-          urlPatterns, heuristics);
+          urlPatterns, heuristics, heu != null);
     } catch (_) {
       return empty();
     }

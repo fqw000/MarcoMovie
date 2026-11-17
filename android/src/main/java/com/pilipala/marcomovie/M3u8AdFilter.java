@@ -17,6 +17,7 @@ final class M3u8AdFilter {
         float durationSec;
         String keyMethod; // null = no KEY seen, "NONE", or e.g. "AES-128"
         int discontinuityBefore; // #EXT-X-DISCONTINUITY markers since previous segment
+        boolean scteAd; // inside a #EXT-X-CUE-OUT/IN or SCTE-35 marked ad break
         int extinfLine;
         int uriLine;
         boolean removed;
@@ -47,12 +48,14 @@ final class M3u8AdFilter {
 
         boolean encrypted = isEncrypted(segments);
 
-        // Rule-based removal is only safe for clear streams: deleting a segment in the middle of
-        // an AES-128 stream shifts the implicit IV of every following segment and breaks
-        // decryption.
+        // Rule-based and SCTE/CUE removal are only safe for clear streams: deleting a segment in
+        // the middle of an AES-128 stream shifts the implicit IV of every following segment and
+        // breaks decryption.
         if (!encrypted) {
             for (Segment segment : segments) {
-                if (rules.matchesSegment(playlistHost, segment.uri)) segment.removed = true;
+                if (segment.scteAd || rules.matchesSegment(playlistHost, segment.uri)) {
+                    segment.removed = true;
+                }
             }
         }
 
@@ -104,6 +107,7 @@ final class M3u8AdFilter {
         List<Segment> segments = new ArrayList<>();
         String currentKey = null;
         int pendingDiscontinuity = 0;
+        boolean inScteAd = false;
         for (int i = 1; i < lines.size(); i++) {
             String trimmed = lines.get(i).trim();
             if (trimmed.startsWith("#EXT-X-KEY:")) {
@@ -112,6 +116,14 @@ final class M3u8AdFilter {
             }
             if (trimmed.startsWith("#EXT-X-DISCONTINUITY")) {
                 pendingDiscontinuity++;
+                continue;
+            }
+            if (isScteAdStart(trimmed)) {
+                inScteAd = true;
+                continue;
+            }
+            if (trimmed.startsWith("#EXT-X-CUE-IN")) {
+                inScteAd = false;
                 continue;
             }
             if (!trimmed.startsWith("#EXTINF:")) continue;
@@ -130,11 +142,23 @@ final class M3u8AdFilter {
             segment.durationSec = parseDuration(trimmed);
             segment.keyMethod = currentKey;
             segment.discontinuityBefore = pendingDiscontinuity;
+            segment.scteAd = inScteAd;
             pendingDiscontinuity = 0;
             segments.add(segment);
             i = uriLine;
         }
         return segments;
+    }
+
+    /** Industry-standard ad-break markers: CUE-OUT/IN and the SCTE-35 family. */
+    private static boolean isScteAdStart(String line) {
+        if (line.startsWith("#EXT-X-CUE-OUT")
+                || line.startsWith("#EXT-X-SCTE35")
+                || line.startsWith("#EXT-OATCLS-SCTE35")) {
+            return true;
+        }
+        return line.startsWith("#EXT-X-DATERANGE")
+                && line.toUpperCase(java.util.Locale.ROOT).contains("SCTE35");
     }
 
     private static String parseKeyMethod(String keyLine) {

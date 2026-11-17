@@ -191,7 +191,10 @@ final class SettingsScreen {
                     + "· hostRules：按域名生效 [{host, regex:[], keywords:[]}]\n"
                     + "· blockedDomains：拦截域名列表（含子域）\n"
                     + "· blockedUrlPatterns：按完整请求 URL 的正则拦截\n"
-                    + "· heuristics：{enabled, minAdBlockDurationSec, maxAdBlockDurationSec, minAdBlockSegments}\n\n"
+                    + "· heuristics：{enabled, minAdBlockSegments, maxAdBlockSegments, keyNoneSwitch,"
+                    + " urlPrefixAnomaly, mirrorReuse, durationWindows}\n"
+                    + "  其中 urlPrefixAnomaly / mirrorReuse / durationWindows 默认关闭（过于激进，"
+                    + " 易误删正片）；SCTE-35 / CUE-OUT / CUE-IN 广告标记始终生效。\n\n"
                     + "也可粘贴 TVBox XC.json / anti-AD 域名 / m3u8-proxy 规则，保存时自动转换。";
 
     void showAdFilterRulesEditor() {
@@ -199,15 +202,6 @@ final class SettingsScreen {
         boolean custom = stored != null && !stored.trim().isEmpty();
         String json = custom ? stored : BuiltinAdRules.json(a);
         if (json == null || json.trim().isEmpty()) json = "{}";
-        if (a.isTvDevice()) {
-            new AppDialog.Builder(a)
-                    .setTitle(custom ? "查看去广告规则（自定义）" : "查看去广告规则（内置）")
-                    .setMessage(json)
-                    .setNeutralButton("从手机输入", (d, w) -> importAdFilterViaLan())
-                    .setNegativeButton("关闭", null)
-                    .show();
-            return;
-        }
         final android.widget.EditText input = new android.widget.EditText(a);
         input.setText(json);
         input.setSingleLine(false);
@@ -224,29 +218,29 @@ final class SettingsScreen {
         a.gap(body, 8);
         body.addView(input, new LinearLayout.LayoutParams(-1, a.dp(240)));
         new AppDialog.Builder(a)
-                .setTitle("查看/编辑去广告规则")
+                .setTitle(custom ? "编辑去广告规则（自定义）" : "编辑去广告规则")
                 .setView(body)
-                .setNeutralButton(
-                        "恢复内置",
-                        (d, w) -> {
-                            a.prefs.edit().remove(Prefs.AD_FILTER_RULES_JSON).apply();
-                            a.toast("已恢复内置去广告规则");
-                            a.refresh();
-                        })
+                .setNeutralButton("选择本地文件", (d, w) -> pickAdFilterRuleFile())
                 .setNegativeButton("取消", null)
                 .setPositiveButton(
                         "保存",
-                        (d, w) -> {
-                            String converted = importAdFilterText(input.getText().toString());
-                            if (converted == null) {
-                                a.toast("未识别的规则格式");
-                                return;
-                            }
-                            a.prefs.edit().putString(Prefs.AD_FILTER_RULES_JSON, converted).apply();
-                            a.toast("已保存去广告规则");
-                            a.refresh();
-                        })
+                        (d, w) -> saveAdFilterRules(input.getText().toString()))
                 .show();
+    }
+
+    void pickAdFilterRuleFile() {
+        pick(47, "*/*", false);
+    }
+
+    private void saveAdFilterRules(String text) {
+        String converted = importAdFilterText(text);
+        if (converted == null) {
+            a.toast("未识别的规则格式");
+            return;
+        }
+        a.prefs.edit().putString(Prefs.AD_FILTER_RULES_JSON, converted).apply();
+        a.toast("已保存去广告规则");
+        a.refresh();
     }
 
     private void importAdFilterFromClipboard() {
@@ -275,7 +269,8 @@ final class SettingsScreen {
     static String importAdFilterText(String text) {
         String trimmed = text.trim();
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-            if (AdFilterRules.parse(trimmed).hasAnyRule()) return trimmed;
+            AdFilterRules internal = AdFilterRules.parse(trimmed);
+            if (internal.hasAnyRule() || internal.heuristicsSpecified) return trimmed;
             String xc = RulesImporter.fromXcJson(trimmed);
             if (xc != null) return xc;
             String proxy = RulesImporter.fromM3u8Proxy(trimmed);
@@ -288,15 +283,19 @@ final class SettingsScreen {
     private String adFilterRuleSummary() {
         boolean enabled = a.prefs.getBoolean(Prefs.AD_FILTER_ENABLED, true);
         if (!enabled) return "已关闭";
+        boolean builtin = a.prefs.getBoolean(Prefs.USE_BUILTIN_RULES, true);
         String stored = a.prefs.getString(Prefs.AD_FILTER_RULES_JSON, "");
-        if (stored == null || stored.trim().isEmpty()) return "内置规则 + 启发式识别";
-        AdFilterRules rules = AdFilterRules.parse(stored);
+        boolean custom = stored != null && !stored.trim().isEmpty();
+        AdFilterRules rules = custom ? AdFilterRules.parse(stored) : AdFilterRules.empty();
         int count =
                 rules.globalRegex.size()
                         + rules.globalKeywords.size()
                         + rules.hostRules.size()
                         + rules.blockedDomains.size();
-        return "自定义规则 · " + count + " 条";
+        if (!builtin && !custom) return "已关闭全部规则";
+        if (builtin && !custom) return "内置规则";
+        if (!builtin) return "自定义规则 · " + count + " 条";
+        return "内置 + 自定义 · " + count + " 条";
     }
 
     static Cms.Video findSortCard(java.util.List<Cms.Video> videos) {
@@ -853,6 +852,7 @@ final class SettingsScreen {
                 });
         toggle("自动播放下一集", Prefs.AUTO_NEXT, true, null);
         toggle("M3U8 去广告", Prefs.AD_FILTER_ENABLED, true, null);
+        toggle("启用内置规则", Prefs.USE_BUILTIN_RULES, true, null);
         link(
                 "去广告规则",
                 adFilterRuleSummary(),
@@ -1277,6 +1277,23 @@ final class SettingsScreen {
                             try (InputStream input = a.getContentResolver().openInputStream(uri)) {
                                 saveWallpaper(a, input);
                             }
+                        } else if (request == 47) {
+                            try (InputStream input = a.getContentResolver().openInputStream(uri)) {
+                                String text = Cms.read(input, 512 * 1024);
+                                String converted = importAdFilterText(text);
+                                if (converted == null) {
+                                    a.ui.post(() -> a.toast("未识别的规则格式"));
+                                    return;
+                                }
+                                a.prefs.edit()
+                                        .putString(Prefs.AD_FILTER_RULES_JSON, converted)
+                                        .apply();
+                                a.ui.post(
+                                        () -> {
+                                            a.toast("已导入去广告规则");
+                                            a.refresh();
+                                        });
+                            }
                         } else if (request == 45) {
                             Object exportedConfig = org.json.JSONObject.NULL;
                             if (a.config != null && a.config.raw != null) {
@@ -1307,7 +1324,8 @@ final class SettingsScreen {
                                         Prefs.SELECTED_SITE,
                                         Prefs.WATCH_HISTORY,
                                         Prefs.FAVORITES,
-                                        Prefs.GLOBAL_SEARCH_HISTORY
+                                        Prefs.GLOBAL_SEARCH_HISTORY,
+                                        Prefs.AD_FILTER_RULES_JSON
                                     }) {
                                 if (a.prefs.contains(dataKey)) {
                                     settings.put(dataKey, a.prefs.getString(dataKey, ""));
@@ -1507,7 +1525,12 @@ final class SettingsScreen {
             else if (clean instanceof Integer) edit.putInt(key, (Integer) clean);
         }
         for (String dataKey :
-                new String[] {Prefs.SELECTED_SITE, Prefs.FAVORITES, Prefs.GLOBAL_SEARCH_HISTORY}) {
+                new String[] {
+                    Prefs.SELECTED_SITE,
+                    Prefs.FAVORITES,
+                    Prefs.GLOBAL_SEARCH_HISTORY,
+                    Prefs.AD_FILTER_RULES_JSON
+                }) {
             if (settings.has(dataKey)) {
                 String cleanData = Prefs.sanitizeUserData(dataKey, settings.opt(dataKey));
                 if (cleanData != null) {

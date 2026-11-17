@@ -17,11 +17,14 @@ public final class AdFilterChecks {
         checkRuleRemoval();
         checkMediaSequenceAdjust();
         checkEncryptedStreamSafety();
+        checkScteMarkerRemoval();
+        checkNoOverMatchByDefault();
         checkDurationWindowHeuristic();
         checkKeyNoneSwitchHeuristic();
         checkMirrorReuseHeuristic();
         checkUrlPrefixHeuristic();
         checkRulesImporters();
+        checkMerge();
         System.out.println("AdFilterChecks: " + checks + " checks passed");
     }
 
@@ -95,26 +98,65 @@ public final class AdFilterChecks {
         check(result.removedSegments == 0, "encrypted stream skips rule-based removal");
     }
 
-    private static void checkDurationWindowHeuristic() {
+    private static void checkScteMarkerRemoval() {
         String playlist =
                 "#EXTM3U\n"
                         + "#EXTINF:10.0,\n"
+                        + "seg0.ts\n"
+                        + "#EXT-X-CUE-OUT:DURATION=15\n"
+                        + "#EXTINF:5.0,\n"
+                        + "ad1.ts\n"
+                        + "#EXTINF:5.0,\n"
+                        + "ad2.ts\n"
+                        + "#EXT-X-CUE-IN\n"
+                        + "#EXTINF:10.0,\n"
+                        + "seg1.ts\n";
+        M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", AdFilterRules.empty());
+        check(result.removedSegments == 2, "SCTE/CUE-OUT removes marked ad block");
+        check(
+                !result.text.contains("ad1.ts") && !result.text.contains("ad2.ts"),
+                "SCTE/CUE drops ad URI lines");
+        check(
+                result.text.contains("seg0.ts") && result.text.contains("seg1.ts"),
+                "SCTE/CUE keeps content segments");
+    }
+
+    /** Regression: variable durations + one long segment must not wipe hundreds of segments. */
+    private static void checkNoOverMatchByDefault() {
+        StringBuilder playlist = new StringBuilder("#EXTM3U\n");
+        for (int i = 0; i < 50; i++) {
+            playlist.append("#EXTINF:10.0,\n").append("s").append(i).append(".ts\n");
+        }
+        playlist.append("#EXTINF:90.0,\n").append("long.ts\n");
+        for (int i = 50; i < 100; i++) {
+            playlist.append("#EXTINF:10.0,\n").append("s").append(i).append(".ts\n");
+        }
+        AdFilterRules rules =
+                AdFilterRules.parse("{\"heuristics\":{\"enabled\":true}}");
+        M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist.toString(), "host", rules);
+        check(result.removedSegments == 0, "default heuristics leave variable-duration content intact");
+    }
+
+    private static void checkDurationWindowHeuristic() {
+        String playlist =
+                "#EXTM3U\n"
+                        + "#EXTINF:40.0,\n"
                         + "a.ts\n"
                         + "#EXTINF:5.0,\n"
                         + "ad1.ts\n"
                         + "#EXTINF:5.0,\n"
                         + "ad2.ts\n"
-                        + "#EXTINF:10.0,\n"
+                        + "#EXTINF:40.0,\n"
                         + "b.ts\n";
         AdFilterRules rules =
                 AdFilterRules.parse(
-                        "{\"heuristics\":{\"enabled\":true,\"minAdBlockDurationSec\":3,"
-                                + "\"maxAdBlockDurationSec\":75,\"minAdBlockSegments\":2}}");
+                        "{\"heuristics\":{\"enabled\":true,\"durationWindows\":true,"
+                                + "\"minAdBlockSegments\":2}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
-        check(result.removedSegments == 2, "duration window removes two short ad segments");
+        check(result.removedSegments == 2, "opt-in duration window removes bounded short block");
         check(
                 !result.text.contains("ad1.ts") && !result.text.contains("ad2.ts"),
-                "duration window drops ad URI lines");
+                "opt-in duration window drops ad URI lines");
     }
 
     private static void checkKeyNoneSwitchHeuristic() {
@@ -146,16 +188,22 @@ public final class AdFilterChecks {
                 "#EXTM3U\n"
                         + "#EXTINF:5.0,\n"
                         + "loop.ts\n"
-                        + "#EXTINF:10.0,\n"
-                        + "content.ts\n"
                         + "#EXTINF:5.0,\n"
-                        + "loop.ts\n";
+                        + "loop.ts\n"
+                        + "#EXTINF:5.0,\n"
+                        + "loop.ts\n"
+                        + "#EXTINF:10.0,\n"
+                        + "c1.ts\n"
+                        + "#EXTINF:10.0,\n"
+                        + "c2.ts\n"
+                        + "#EXTINF:10.0,\n"
+                        + "c3.ts\n";
         AdFilterRules rules =
                 AdFilterRules.parse(
-                        "{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2,\"mirrorReuse\":true}}");
+                        "{\"heuristics\":{\"enabled\":true,\"mirrorReuse\":true}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
-        check(result.removedSegments == 2, "mirror reuse removes repeated URI segments");
-        check(result.text.contains("content.ts"), "mirror reuse keeps unique segment");
+        check(result.removedSegments == 3, "opt-in mirror reuse removes repeated ad-loop URI");
+        check(result.text.contains("c1.ts") && result.text.contains("c2.ts"), "mirror reuse keeps unique segments");
     }
 
     private static void checkUrlPrefixHeuristic() {
@@ -173,10 +221,10 @@ public final class AdFilterChecks {
                 AdFilterRules.parse(
                         "{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2,\"urlPrefixAnomaly\":true}}");
         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
-        check(result.removedSegments == 2, "url prefix anomaly removes off-prefix block");
+        check(result.removedSegments == 2, "host anomaly removes off-host ad block");
         check(
                 result.text.contains("cdn.test"),
-                "url prefix anomaly keeps dominant prefix segments");
+                "host anomaly keeps dominant host segments");
     }
 
     private static void checkRulesImporters() {
@@ -207,5 +255,35 @@ public final class AdFilterChecks {
         check(
                 mergedRules.hostRules.size() == 1 && mergedRules.blockedDomains.size() == 2,
                 "merge combines host rules and domains");
+    }
+
+    private static void checkMerge() {
+        AdFilterRules base =
+                AdFilterRules.parse(
+                        "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"base_ad\"}],"
+                                + "\"heuristics\":{\"enabled\":true,\"keyNoneSwitch\":true}}");
+        AdFilterRules customNoHeu =
+                AdFilterRules.parse(
+                        "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"custom_ad\"}]}");
+        AdFilterRules merged = AdFilterRules.merge(base, customNoHeu);
+        check(
+                merged.globalKeywords.size() == 2,
+                "merge unions builtin and custom keywords");
+        check(
+                merged.heuristics.enabled && merged.heuristics.keyNoneSwitch,
+                "merge keeps builtin heuristics when custom omits them");
+
+        AdFilterRules customHeu =
+                AdFilterRules.parse(
+                        "{\"heuristics\":{\"enabled\":false}}");
+        AdFilterRules merged2 = AdFilterRules.merge(base, customHeu);
+        check(
+                !merged2.heuristics.enabled,
+                "merge uses custom heuristics when explicitly specified");
+
+        AdFilterRules customOnly = AdFilterRules.merge(AdFilterRules.empty(), customNoHeu);
+        check(
+                customOnly.globalKeywords.size() == 1,
+                "merge with empty base keeps custom rules");
     }
 }

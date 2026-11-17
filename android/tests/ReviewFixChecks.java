@@ -188,7 +188,7 @@ public final class ReviewFixChecks {
         // to or removed from Prefs.KEYS. Security policy switches (such as EXPERIMENTAL_CSP and
         // ONLY_ALLOW_HTTPS_PLUGINS) are intentionally excluded so backups cannot weaken policy.
         check(
-                Prefs.KEYS.length == 39,
+                Prefs.KEYS.length == 40,
                 "backup settings key table includes TV dock position, TV player style, tunneled playback, ad filtering, and existing appearance settings");
         check(
                 Integer.valueOf(0).equals(Prefs.sanitizeSetting(Prefs.TV_DOCK_POSITION, 0))

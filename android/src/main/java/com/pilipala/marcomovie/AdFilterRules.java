@@ -45,12 +45,14 @@ final class AdFilterRules {
 
     static final class Heuristics {
         boolean enabled;
-        int minAdBlockDurationSec = 3;
-        int maxAdBlockDurationSec = 75;
+        int minAdBlockDurationSec = 4;
+        int maxAdBlockDurationSec = 30;
         int minAdBlockSegments = 2;
-        boolean urlPrefixAnomaly = true;
+        int maxAdBlockSegments = 8;
+        boolean urlPrefixAnomaly = false;
         boolean keyNoneSwitch = true;
-        boolean mirrorReuse = true;
+        boolean mirrorReuse = false;
+        boolean durationWindows = false;
     }
 
     final List<Pattern> globalRegex;
@@ -59,6 +61,7 @@ final class AdFilterRules {
     final Set<String> blockedDomains;
     final List<Pattern> blockedUrlPatterns;
     final Heuristics heuristics;
+    final boolean heuristicsSpecified;
 
     private AdFilterRules(
             List<Pattern> globalRegex,
@@ -66,13 +69,15 @@ final class AdFilterRules {
             List<HostRule> hostRules,
             Set<String> blockedDomains,
             List<Pattern> blockedUrlPatterns,
-            Heuristics heuristics) {
+            Heuristics heuristics,
+            boolean heuristicsSpecified) {
         this.globalRegex = globalRegex;
         this.globalKeywords = globalKeywords;
         this.hostRules = hostRules;
         this.blockedDomains = blockedDomains;
         this.blockedUrlPatterns = blockedUrlPatterns;
         this.heuristics = heuristics;
+        this.heuristicsSpecified = heuristicsSpecified;
     }
 
     static AdFilterRules empty() {
@@ -82,7 +87,43 @@ final class AdFilterRules {
                 Collections.emptyList(),
                 Collections.emptySet(),
                 Collections.emptyList(),
-                new Heuristics());
+                new Heuristics(),
+                false);
+    }
+
+    /**
+     * Combines a base rule set (typically built-in) with a custom rule set. All rule lists and
+     * host/domain sets are unioned; the custom heuristics override the base heuristics only when
+     * the custom JSON actually specified a {@code heuristics} block.
+     */
+    static AdFilterRules merge(AdFilterRules base, AdFilterRules custom) {
+        if (base == null || (base.globalRegex.isEmpty()
+                && base.globalKeywords.isEmpty()
+                && base.hostRules.isEmpty()
+                && base.blockedDomains.isEmpty()
+                && base.blockedUrlPatterns.isEmpty())) {
+            return custom == null ? empty() : custom;
+        }
+        if (custom == null) return base;
+        List<Pattern> globalRegex = new ArrayList<>(base.globalRegex);
+        globalRegex.addAll(custom.globalRegex);
+        List<String> globalKeywords = new ArrayList<>(base.globalKeywords);
+        globalKeywords.addAll(custom.globalKeywords);
+        List<HostRule> hostRules = new ArrayList<>(base.hostRules);
+        hostRules.addAll(custom.hostRules);
+        Set<String> blockedDomains = new HashSet<>(base.blockedDomains);
+        blockedDomains.addAll(custom.blockedDomains);
+        List<Pattern> blockedUrlPatterns = new ArrayList<>(base.blockedUrlPatterns);
+        blockedUrlPatterns.addAll(custom.blockedUrlPatterns);
+        Heuristics heuristics = custom.heuristicsSpecified ? custom.heuristics : base.heuristics;
+        return new AdFilterRules(
+                globalRegex,
+                globalKeywords,
+                hostRules,
+                blockedDomains,
+                blockedUrlPatterns,
+                heuristics,
+                base.heuristicsSpecified || custom.heuristicsSpecified);
     }
 
     static AdFilterRules parse(String json) {
@@ -155,15 +196,23 @@ final class AdFilterRules {
             JSONObject heu = root.optJSONObject("heuristics");
             if (heu != null) {
                 heuristics.enabled = heu.optBoolean("enabled", false);
-                heuristics.minAdBlockDurationSec = heu.optInt("minAdBlockDurationSec", 3);
-                heuristics.maxAdBlockDurationSec = heu.optInt("maxAdBlockDurationSec", 75);
+                heuristics.minAdBlockDurationSec = heu.optInt("minAdBlockDurationSec", 4);
+                heuristics.maxAdBlockDurationSec = heu.optInt("maxAdBlockDurationSec", 30);
                 heuristics.minAdBlockSegments = heu.optInt("minAdBlockSegments", 2);
-                heuristics.urlPrefixAnomaly = heu.optBoolean("urlPrefixAnomaly", true);
+                heuristics.maxAdBlockSegments = heu.optInt("maxAdBlockSegments", 8);
+                heuristics.urlPrefixAnomaly = heu.optBoolean("urlPrefixAnomaly", false);
                 heuristics.keyNoneSwitch = heu.optBoolean("keyNoneSwitch", true);
-                heuristics.mirrorReuse = heu.optBoolean("mirrorReuse", true);
+                heuristics.mirrorReuse = heu.optBoolean("mirrorReuse", false);
+                heuristics.durationWindows = heu.optBoolean("durationWindows", false);
             }
             return new AdFilterRules(
-                    globalRegex, globalKeywords, hostRules, domains, urlPatterns, heuristics);
+                    globalRegex,
+                    globalKeywords,
+                    hostRules,
+                    domains,
+                    urlPatterns,
+                    heuristics,
+                    heu != null);
         } catch (Exception ignored) {
             return empty();
         }

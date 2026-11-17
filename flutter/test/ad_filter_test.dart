@@ -66,19 +66,56 @@ void main() {
     expect(result.removedSegments, 0);
   });
 
-  test('duration window removes short ad segments', () {
+  test('SCTE/CUE-OUT removes marked ad block', () {
     final playlist = '#EXTM3U\n'
         '#EXTINF:10.0,\n'
+        'seg0.ts\n'
+        '#EXT-X-CUE-OUT:DURATION=15\n'
+        '#EXTINF:5.0,\n'
+        'ad1.ts\n'
+        '#EXTINF:5.0,\n'
+        'ad2.ts\n'
+        '#EXT-X-CUE-IN\n'
+        '#EXTINF:10.0,\n'
+        'seg1.ts\n';
+    final result = M3u8AdFilter.filter(playlist, 'host', AdFilterRules.empty());
+    expect(result.removedSegments, 2);
+    expect(result.text.contains('ad1.ts'), isFalse);
+    expect(result.text.contains('ad2.ts'), isFalse);
+    expect(result.text.contains('seg0.ts'), isTrue);
+    expect(result.text.contains('seg1.ts'), isTrue);
+  });
+
+  test('default heuristics leave variable-duration content intact', () {
+    final buffer = StringBuffer('#EXTM3U\n');
+    for (var i = 0; i < 50; i++) {
+      buffer.write('#EXTINF:10.0,\n');
+      buffer.write('s$i.ts\n');
+    }
+    buffer.write('#EXTINF:90.0,\n');
+    buffer.write('long.ts\n');
+    for (var i = 50; i < 100; i++) {
+      buffer.write('#EXTINF:10.0,\n');
+      buffer.write('s$i.ts\n');
+    }
+    final rules = AdFilterRules.parse('{"heuristics":{"enabled":true}}');
+    final result = M3u8AdFilter.filter(buffer.toString(), 'host', rules);
+    expect(result.removedSegments, 0);
+  });
+
+  test('opt-in duration window removes bounded short block', () {
+    final playlist = '#EXTM3U\n'
+        '#EXTINF:40.0,\n'
         'a.ts\n'
         '#EXTINF:5.0,\n'
         'ad1.ts\n'
         '#EXTINF:5.0,\n'
         'ad2.ts\n'
-        '#EXTINF:10.0,\n'
+        '#EXTINF:40.0,\n'
         'b.ts\n';
     final rules = AdFilterRules.parse(
-        '{"heuristics":{"enabled":true,"minAdBlockDurationSec":3,'
-        '"maxAdBlockDurationSec":75,"minAdBlockSegments":2}}');
+        '{"heuristics":{"enabled":true,"durationWindows":true,'
+        '"minAdBlockSegments":2}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
     expect(result.removedSegments, 2);
     expect(result.text.contains('ad1.ts'), isFalse);
@@ -106,19 +143,26 @@ void main() {
     expect(result.text.contains('clear2.ts'), isFalse);
   });
 
-  test('mirror reuse removes repeated URI segments', () {
+  test('mirror reuse removes repeated ad-loop URI', () {
     final playlist = '#EXTM3U\n'
         '#EXTINF:5.0,\n'
         'loop.ts\n'
-        '#EXTINF:10.0,\n'
-        'content.ts\n'
         '#EXTINF:5.0,\n'
-        'loop.ts\n';
+        'loop.ts\n'
+        '#EXTINF:5.0,\n'
+        'loop.ts\n'
+        '#EXTINF:10.0,\n'
+        'c1.ts\n'
+        '#EXTINF:10.0,\n'
+        'c2.ts\n'
+        '#EXTINF:10.0,\n'
+        'c3.ts\n';
     final rules = AdFilterRules.parse(
-        '{"heuristics":{"enabled":true,"minAdBlockSegments":2,"mirrorReuse":true}}');
+        '{"heuristics":{"enabled":true,"mirrorReuse":true}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
-    expect(result.removedSegments, 2);
-    expect(result.text.contains('content.ts'), isTrue);
+    expect(result.removedSegments, 3);
+    expect(result.text.contains('c1.ts'), isTrue);
+    expect(result.text.contains('c2.ts'), isTrue);
   });
 
   test('url prefix anomaly removes off-prefix block', () {
@@ -178,5 +222,21 @@ void main() {
     final mergedRules = AdFilterRules.parse(merged!);
     expect(mergedRules.hostRules.length, 1);
     expect(mergedRules.blockedDomains.length, 2);
+  });
+
+  test('AdFilterRules.merge combines builtin and custom', () {
+    final base = AdFilterRules.parse(
+        '{"playlistRules":[{"type":"keyword","pattern":"base_ad"}],'
+        '"heuristics":{"enabled":true,"keyNoneSwitch":true}}');
+    final customNoHeu = AdFilterRules.parse(
+        '{"playlistRules":[{"type":"keyword","pattern":"custom_ad"}]}');
+    final merged = AdFilterRules.merge(base, customNoHeu);
+    expect(merged.globalKeywords.length, 2);
+    expect(merged.heuristics.enabled, isTrue);
+    expect(merged.heuristics.keyNoneSwitch, isTrue);
+
+    final customHeu = AdFilterRules.parse('{"heuristics":{"enabled":false}}');
+    final merged2 = AdFilterRules.merge(base, customHeu);
+    expect(merged2.heuristics.enabled, isFalse);
   });
 }

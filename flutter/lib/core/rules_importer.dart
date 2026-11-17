@@ -170,13 +170,29 @@ class RulesImporter {
   static Map<String, dynamic> _defaultHeuristics() {
     return {
       'enabled': true,
-      'minAdBlockDurationSec': 3,
-      'maxAdBlockDurationSec': 75,
+      'minAdBlockDurationSec': 4,
+      'maxAdBlockDurationSec': 30,
       'minAdBlockSegments': 2,
-      'urlPrefixAnomaly': true,
+      'maxAdBlockSegments': 8,
+      'urlPrefixAnomaly': false,
       'keyNoneSwitch': true,
-      'mirrorReuse': true,
+      'mirrorReuse': false,
+      'durationWindows': false,
     };
+  }
+
+  /// Converts any accepted rule input (internal schema, TVBox XC.json, anti-AD
+  /// hosts text, or m3u8-proxy rules) into the internal schema, or returns null.
+  static String? importText(String? text) {
+    if (text == null) return null;
+    final trimmed = text.trim();
+    if (trimmed.isEmpty) return null;
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      final internal = AdFilterRules.parse(trimmed);
+      if (internal.hasAnyRule() || internal.heuristicsSpecified) return trimmed;
+      return fromXcJson(trimmed) ?? fromM3u8Proxy(trimmed);
+    }
+    return fromAntiAd(trimmed);
   }
 
   static String? _domainFromHostsLine(String line) {

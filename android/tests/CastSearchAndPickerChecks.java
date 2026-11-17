@@ -471,7 +471,7 @@ public final class CastSearchAndPickerChecks {
     }
 
     public static void main(String[] args) throws Exception {
-        check(Prefs.KEYS.length == 39, "Prefs.KEYS length preserved at 39");
+        check(Prefs.KEYS.length == 40, "Prefs.KEYS length preserved at 40");
         testSourcePickerEdits();
         testSearchInputServer();
         testCastServiceDlnaAndWeb();

@@ -3,14 +3,19 @@ package com.pilipala.marcomovie;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 
 /**
- * Heuristic ad-segment detection for media playlists whose ad inserts cannot be described by
- * static regex/keyword rules. The four detectors mirror the well-known takagen99-style m3u8 ad
- * filter heuristics: clear blocks inside encrypted streams, anomalous URL prefixes, isolated
- * short-duration windows, and repeated (mirror) segment URIs.
+ * Conservative heuristic ad-segment detection for media playlists whose ad inserts cannot be
+ * described by static rules or the industry-standard SCTE-35/CUE markers handled in {@link
+ * M3u8AdFilter}.
+ *
+ * <p>The reliable signals (URL rules, SCTE/CUE markers, KEY-NONE clear blocks inside encrypted
+ * streams) are the default. The duration-window, URL-prefix and mirror-reuse detectors are too
+ * eager on real-world playlists, so they are opt-in and disabled by default; when enabled they
+ * require strong, bounded evidence rather than treating any short or repeated segment as an ad.
  */
 final class HeuristicAdDetector {
     private HeuristicAdDetector() {}
@@ -26,9 +31,9 @@ final class HeuristicAdDetector {
             if (cfg.keyNoneSwitch) remove.addAll(detectKeyNoneSwitch(segments, cfg));
             return remove;
         }
-        if (cfg.urlPrefixAnomaly) remove.addAll(detectUrlPrefixAnomaly(segments, cfg));
-        if (cfg.mirrorReuse) remove.addAll(detectMirrorReuse(segments));
-        remove.addAll(detectDurationWindows(segments, cfg));
+        if (cfg.urlPrefixAnomaly) remove.addAll(detectHostAnomaly(segments, cfg));
+        if (cfg.mirrorReuse) remove.addAll(detectMirrorReuse(segments, cfg));
+        if (cfg.durationWindows) remove.addAll(detectDurationWindows(segments, cfg));
         return remove;
     }
 
@@ -51,7 +56,9 @@ final class HeuristicAdDetector {
             int length = end - start;
             boolean boundedLeft = start > 0 && !isClear(segments.get(start - 1));
             boolean boundedRight = end < segments.size() && !isClear(segments.get(end));
-            if (length >= cfg.minAdBlockSegments && (boundedLeft || boundedRight)) {
+            if (length >= cfg.minAdBlockSegments
+                    && length <= cfg.maxAdBlockSegments
+                    && (boundedLeft || boundedRight)) {
                 for (int i = start; i < end; i++) remove.add(i);
             }
             start = end;
@@ -59,25 +66,33 @@ final class HeuristicAdDetector {
         return remove;
     }
 
-    /** Removes contiguous runs whose URL prefix diverges from the playlist's dominant prefix. */
-    private static Set<Integer> detectUrlPrefixAnomaly(
+    /**
+     * Removes short contiguous runs served from a different host than the playlist's dominant host,
+     * only when the run is bounded on both sides by the dominant host (classic ad-CD insert).
+     */
+    private static Set<Integer> detectHostAnomaly(
             List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
         Set<Integer> remove = new HashSet<>();
-        String prefix = dominantPrefix(segments);
-        if (prefix == null || prefix.isEmpty()) return remove;
+        String dominantHost = dominantHost(segments);
+        if (dominantHost == null || dominantHost.isEmpty()) return remove;
         int start = 0;
         while (start < segments.size()) {
-            if (segments.get(start).uri.startsWith(prefix)) {
+            if (dominantHost.equals(hostOf(segments.get(start).uri))) {
                 start++;
                 continue;
             }
             int end = start;
-            while (end < segments.size() && !segments.get(end).uri.startsWith(prefix)) end++;
+            while (end < segments.size()
+                    && !dominantHost.equals(hostOf(segments.get(end).uri))) end++;
             int length = end - start;
-            boolean boundedLeft = start > 0 && segments.get(start - 1).uri.startsWith(prefix);
+            boolean boundedLeft =
+                    start > 0 && dominantHost.equals(hostOf(segments.get(start - 1).uri));
             boolean boundedRight =
-                    end < segments.size() && segments.get(end).uri.startsWith(prefix);
-            if (length >= cfg.minAdBlockSegments && (boundedLeft || boundedRight)) {
+                    end < segments.size() && dominantHost.equals(hostOf(segments.get(end).uri));
+            if (length >= cfg.minAdBlockSegments
+                    && length <= cfg.maxAdBlockSegments
+                    && boundedLeft
+                    && boundedRight) {
                 for (int i = start; i < end; i++) remove.add(i);
             }
             start = end;
@@ -85,8 +100,13 @@ final class HeuristicAdDetector {
         return remove;
     }
 
-    /** Removes every occurrence of a URI that repeats across the playlist (ad loop evidence). */
-    private static Set<Integer> detectMirrorReuse(List<M3u8AdFilter.Segment> segments) {
+    /**
+     * Removes every occurrence of a URI that repeats heavily (ad-loop evidence) while the rest of
+     * the playlist is mostly unique. Requires at least three repeats, at least four distinct URIs,
+     * and short segment durations so ordinary repeated placeholders do not match.
+     */
+    private static Set<Integer> detectMirrorReuse(
+            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
         Set<Integer> remove = new HashSet<>();
         Map<String, Integer> counts = new HashMap<>();
         for (M3u8AdFilter.Segment segment : segments) {
@@ -94,40 +114,53 @@ final class HeuristicAdDetector {
             Integer seen = counts.get(segment.uri);
             counts.put(segment.uri, (seen == null ? 0 : seen) + 1);
         }
-        if (counts.size() <= 1) return remove;
+        if (counts.size() < 4) return remove;
         for (int i = 0; i < segments.size(); i++) {
-            String uri = segments.get(i).uri;
-            Integer seen = uri == null ? null : counts.get(uri);
-            if (seen != null && seen >= 2) remove.add(i);
+            M3u8AdFilter.Segment segment = segments.get(i);
+            if (segment.uri == null || segment.uri.isEmpty()) continue;
+            Integer seen = counts.get(segment.uri);
+            if (seen != null
+                    && seen >= 3
+                    && segment.durationSec > 0f
+                    && segment.durationSec <= cfg.maxAdBlockDurationSec) {
+                remove.add(i);
+            }
         }
         return remove;
     }
 
-    /** Removes isolated windows of short-duration segments sandwiched between longer content. */
+    /**
+     * Removes a short, uniformly-timed block of segments (2..{@code maxAdBlockSegments}) that is
+     * bounded on both sides by clearly longer content, with no discontinuity inside. Disabled by
+     * default: segment duration alone is an unreliable ad signal in HLS.
+     */
     private static Set<Integer> detectDurationWindows(
             List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
         Set<Integer> remove = new HashSet<>();
-        float contentDuration = 0f;
-        for (M3u8AdFilter.Segment segment : segments) {
-            if (segment.durationSec > contentDuration) contentDuration = segment.durationSec;
-        }
-        if (contentDuration <= 0f) return remove;
         int start = 0;
         while (start < segments.size()) {
-            if (!isAdLikeDuration(segments.get(start), cfg, contentDuration)) {
+            if (!isAdLikeDuration(segments.get(start), cfg)) {
                 start++;
                 continue;
             }
             int end = start;
-            while (end < segments.size()
-                    && isAdLikeDuration(segments.get(end), cfg, contentDuration)) end++;
+            while (end < segments.size() && isAdLikeDuration(segments.get(end), cfg)) end++;
             int length = end - start;
-            boolean boundedContentLeft =
-                    start > 0 && !isAdLikeDuration(segments.get(start - 1), cfg, contentDuration);
-            boolean boundedContentRight =
-                    end < segments.size()
-                            && !isAdLikeDuration(segments.get(end), cfg, contentDuration);
-            if (length >= cfg.minAdBlockSegments && (boundedContentLeft || boundedContentRight)) {
+            boolean boundedLeft = start > 0 && isLongContent(segments.get(start - 1), cfg);
+            boolean boundedRight =
+                    end < segments.size() && isLongContent(segments.get(end), cfg);
+            boolean noDiscontinuity = true;
+            for (int i = start; i < end; i++) {
+                if (segments.get(i).discontinuityBefore > 0) {
+                    noDiscontinuity = false;
+                    break;
+                }
+            }
+            if (length >= cfg.minAdBlockSegments
+                    && length <= cfg.maxAdBlockSegments
+                    && boundedLeft
+                    && boundedRight
+                    && noDiscontinuity) {
                 for (int i = start; i < end; i++) remove.add(i);
             }
             start = end;
@@ -136,25 +169,27 @@ final class HeuristicAdDetector {
     }
 
     private static boolean isAdLikeDuration(
-            M3u8AdFilter.Segment segment, AdFilterRules.Heuristics cfg, float contentDuration) {
+            M3u8AdFilter.Segment segment, AdFilterRules.Heuristics cfg) {
         float duration = segment.durationSec;
-        return duration > 0f
-                && duration >= cfg.minAdBlockDurationSec
-                && duration <= cfg.maxAdBlockDurationSec
-                && duration < contentDuration;
+        return duration >= cfg.minAdBlockDurationSec && duration <= cfg.maxAdBlockDurationSec;
     }
 
-    private static String dominantPrefix(List<M3u8AdFilter.Segment> segments) {
-        Map<String, Integer> prefixes = new HashMap<>();
+    private static boolean isLongContent(
+            M3u8AdFilter.Segment segment, AdFilterRules.Heuristics cfg) {
+        return segment.durationSec > cfg.maxAdBlockDurationSec;
+    }
+
+    private static String dominantHost(List<M3u8AdFilter.Segment> segments) {
+        Map<String, Integer> hosts = new HashMap<>();
         for (M3u8AdFilter.Segment segment : segments) {
-            String prefix = urlPrefix(segment.uri);
-            if (prefix == null || prefix.isEmpty()) continue;
-            Integer seen = prefixes.get(prefix);
-            prefixes.put(prefix, (seen == null ? 0 : seen) + 1);
+            String host = hostOf(segment.uri);
+            if (host == null || host.isEmpty()) continue;
+            Integer seen = hosts.get(host);
+            hosts.put(host, (seen == null ? 0 : seen) + 1);
         }
         String best = null;
         int bestCount = 0;
-        for (Map.Entry<String, Integer> entry : prefixes.entrySet()) {
+        for (Map.Entry<String, Integer> entry : hosts.entrySet()) {
             if (entry.getValue() > bestCount) {
                 best = entry.getKey();
                 bestCount = entry.getValue();
@@ -163,10 +198,18 @@ final class HeuristicAdDetector {
         return best;
     }
 
-    private static String urlPrefix(String uri) {
+    /** Extracts the host portion of an absolute {@code http(s)://host[:port]/...} URL. */
+    private static String hostOf(String uri) {
         if (uri == null) return null;
-        int slash = uri.lastIndexOf('/');
-        if (slash < 0) return null;
-        return uri.substring(0, slash + 1);
+        int scheme = uri.indexOf("://");
+        int start = scheme >= 0 ? scheme + 3 : 0;
+        int end = start;
+        while (end < uri.length()) {
+            char c = uri.charAt(end);
+            if (c == '/' || c == '?' || c == '#' || c == ':') break;
+            end++;
+        }
+        String host = uri.substring(start, end).trim();
+        return host.isEmpty() ? null : host.toLowerCase(Locale.ROOT);
     }
 }

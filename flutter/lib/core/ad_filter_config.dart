@@ -5,9 +5,9 @@ import 'storage_service.dart';
 
 /// Loads the ad-filter rule set for the Flutter playback path.
 ///
-/// Precedence matches the Android TV implementation: an explicit custom rules
-/// JSON stored by the user, otherwise the bundled builtin rules, and neither
-/// when the feature is disabled.
+/// Matches the Android TV implementation: the built-in rules are combined with
+/// any stored custom rules, the built-in layer can be disabled independently,
+/// and nothing is applied when the feature is off.
 class AdFilterConfig {
   AdFilterConfig._();
 
@@ -29,12 +29,13 @@ class AdFilterConfig {
 
   static Future<AdFilterRules> load(StorageService storage) async {
     if (!storage.adFilterEnabled) return AdFilterRules.empty();
-    final custom = storage.adFilterRulesJson.trim();
-    if (custom.isNotEmpty) {
-      final parsed = AdFilterRules.parse(custom);
-      if (parsed.hasAnyRule()) return parsed;
-    }
-    final builtin = await _loadBuiltinJson();
-    return AdFilterRules.parse(builtin ?? '');
+    final builtin = storage.useBuiltinRules
+        ? AdFilterRules.parse(await _loadBuiltinJson() ?? '')
+        : AdFilterRules.empty();
+    final customJson = storage.adFilterRulesJson.trim();
+    final custom = customJson.isNotEmpty
+        ? AdFilterRules.parse(customJson)
+        : AdFilterRules.empty();
+    return AdFilterRules.merge(builtin, custom);
   }
 }

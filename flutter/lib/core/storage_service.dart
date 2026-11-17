@@ -87,6 +87,7 @@ class StorageService {
   static const String keyPlayerAlwaysShowClock = 'player_always_show_clock';
   static const String keyAdFilterEnabled = 'ad_filter_enabled';
   static const String keyAdFilterRulesJson = 'ad_filter_rules_json';
+  static const String keyUseBuiltinRules = 'use_builtin_rules';
   static const int maxVideoSkipRecords = 500;
   static const String _subscriptionsFileName = 'subscriptions.json';
   static const String _watchHistoryFileName = 'watch_history.json';
@@ -670,6 +671,7 @@ class StorageService {
       _prefs.getBool(keyPlayerAlwaysShowClock) ?? false;
   bool get adFilterEnabled => _prefs.getBool(keyAdFilterEnabled) ?? true;
   String get adFilterRulesJson => _prefs.getString(keyAdFilterRulesJson) ?? '';
+  bool get useBuiltinRules => _prefs.getBool(keyUseBuiltinRules) ?? true;
   String get repeatMode => _prefs.getString(keyRepeatMode) ?? 'off';
   String get wallpaperPreset =>
       _prefs.getString(keyWallpaperPreset) ?? 'obsidian';
@@ -1970,6 +1972,10 @@ class StorageService {
   Future<void> setAdFilterRulesJson(String value) async {
     await _prefs.setString(keyAdFilterRulesJson, value);
   }
+
+  Future<void> setUseBuiltinRules(bool value) async {
+    await _prefs.setBool(keyUseBuiltinRules, value);
+  }
   static String _videoSkipKey(String siteKey, String videoId) {
     final s = siteKey.trim();
     final v = videoId.trim();
@@ -2863,6 +2869,9 @@ class StorageService {
         keyEpisodesDescending: episodesDescending,
         keyPlaySpeed: playSpeed,
         keyAutoNext: autoNext,
+        keyAdFilterEnabled: adFilterEnabled,
+        keyUseBuiltinRules: useBuiltinRules,
+        keyAdFilterRulesJson: adFilterRulesJson,
       },
     );
   }
@@ -2967,6 +2976,15 @@ class StorageService {
     for (final key in _appearanceBooleans) {
       if (settings.containsKey(key) && settings[key] is! bool) throw const FormatException('外观设置格式无效');
     }
+    if (settings.containsKey(keyAdFilterEnabled) && settings[keyAdFilterEnabled] is! bool) {
+      throw const FormatException('去广告开关格式无效');
+    }
+    if (settings.containsKey(keyUseBuiltinRules) && settings[keyUseBuiltinRules] is! bool) {
+      throw const FormatException('内置规则开关格式无效');
+    }
+    if (settings.containsKey(keyAdFilterRulesJson) && settings[keyAdFilterRulesJson] is! String) {
+      throw const FormatException('去广告规则格式无效');
+    }
     final incoming = <SubscriptionEntry>[];
     final ids = <String>{};
     final updatedSubs = settings[keySubscriptions];
@@ -3050,6 +3068,16 @@ class StorageService {
       if (value is int && value >= 0 && value <= 600) await _prefs.setInt(key, value);
     }
     if (['off','one','all'].contains(settings[keyRepeatMode])) await setRepeatMode(settings[keyRepeatMode] as String);
+    if (settings[keyAdFilterEnabled] is bool) {
+      await setAdFilterEnabled(settings[keyAdFilterEnabled] as bool);
+    }
+    if (settings[keyUseBuiltinRules] is bool) {
+      await setUseBuiltinRules(settings[keyUseBuiltinRules] as bool);
+    }
+    final adFilterRules = settings[keyAdFilterRulesJson];
+    if (adFilterRules is String && adFilterRules.length <= 262144) {
+      await setAdFilterRulesJson(adFilterRules);
+    }
     CmsConfig? parsedConfig = decoded.parsedConfig;
     if (decoded.rawConfig.isNotEmpty) {
       await _prefs.setString(keyRawConfig, decoded.rawConfig);

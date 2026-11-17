@@ -25,6 +25,8 @@ import '../core/netdisk_service.dart';
 import '../core/storage_service.dart';
 import '../core/app_log.dart';
 import '../core/search_source_notice.dart';
+import '../core/ad_filter_rules.dart';
+import '../core/rules_importer.dart';
 import 'apple_theme.dart';
 import 'cloud_sync_panel.dart';
 import 'detail_screen.dart';
@@ -7092,20 +7094,43 @@ class _AdaptiveShellState extends State<AdaptiveShell>
                   ),
                 ],
               ),
-              IosSettingsGroup(
-                header: '去广告',
-                footer: '按内置规则与启发式识别过滤 HLS 播放列表中的广告分段。',
-                children: [
-                  toggleRow(
-                    'M3U8 去广告',
-                    CupertinoIcons.shield_lefthalf_fill,
-                    AppleColors.systemGreen,
-                    storage.adFilterEnabled,
-                    storage.setAdFilterEnabled,
-                  ),
-                ],
-              ),
             ]),
+          ),
+          SettingsPane(
+            'adfilter',
+            '去广告',
+            '',
+            CupertinoIcons.shield_lefthalf_fill,
+            AppleColors.systemGreen,
+            trailingText: _adFilterRulesSummary(storage),
+            content: IosSettingsGroup(
+              header: 'HLS 广告过滤',
+              footer: '按内置与自定义规则过滤播放列表中的广告分段；SCTE-35 / CUE-OUT / CUE-IN 标记始终生效。',
+              children: [
+                toggleRow(
+                  'M3U8 去广告',
+                  CupertinoIcons.shield_lefthalf_fill,
+                  AppleColors.systemGreen,
+                  storage.adFilterEnabled,
+                  storage.setAdFilterEnabled,
+                ),
+                toggleRow(
+                  '启用内置规则',
+                  CupertinoIcons.book_fill,
+                  AppleColors.systemTeal,
+                  storage.useBuiltinRules,
+                  storage.setUseBuiltinRules,
+                ),
+                IosSettingsRow(
+                  icon: CupertinoIcons.doc_text_fill,
+                  iconColor: AppleColors.systemOrange,
+                  title: '编辑自定义规则',
+                  subtitle: _adFilterRulesSummary(storage),
+                  showChevron: true,
+                  onTap: () => _showAdFilterRulesEditor(),
+                ),
+              ],
+            ),
           ),
           SettingsPane(
             'skip',
@@ -9418,6 +9443,167 @@ class _AdaptiveShellState extends State<AdaptiveShell>
       if (mounted) _showAppleNotice('删除未保存', '$e');
       return false;
     }
+  }
+
+  String _adFilterRulesSummary(StorageService storage) {
+    if (!storage.adFilterEnabled) return '已关闭';
+    final builtin = storage.useBuiltinRules;
+    final customJson = storage.adFilterRulesJson.trim();
+    final custom = customJson.isNotEmpty
+        ? AdFilterRules.parse(customJson)
+        : AdFilterRules.empty();
+    final count = custom.globalRegex.length +
+        custom.globalKeywords.length +
+        custom.hostRules.length +
+        custom.blockedDomains.length;
+    if (!builtin && customJson.isEmpty) return '未启用规则';
+    if (builtin && customJson.isEmpty) return '内置规则';
+    if (!builtin) return '自定义 $count 条';
+    return '内置 + 自定义 $count 条';
+  }
+
+  Future<String> _loadBuiltinRulesText() async {
+    const asset = 'assets/adfilter/builtin_rules.json';
+    try {
+      return await rootBundle.loadString(asset);
+    } catch (_) {
+      return '{}';
+    }
+  }
+
+  Future<void> _showAdFilterRulesEditor() async {
+    final customJson = widget.storage.adFilterRulesJson.trim();
+    final initial = customJson.isNotEmpty
+        ? customJson
+        : await _loadBuiltinRulesText();
+    final ctrl = TextEditingController(text: initial);
+    String? error;
+    bool saving = false;
+
+    await _openIosOrModalPage<void>(
+      title: '编辑去广告规则',
+      backLabel: '返回',
+      maxWidth: 640,
+      ignoreKeyboardInsets: true,
+      builder: (sheetCtx) => StatefulBuilder(
+        builder: (sheetCtx, setModalState) {
+          final bottomInset = MediaQuery.viewInsetsOf(sheetCtx).bottom +
+              MediaQuery.paddingOf(sheetCtx).bottom;
+          return SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(18, 12, 18, 18 + bottomInset),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  '支持本应用规则 JSON，也接受 TVBox XC.json、anti-AD 域名列表、'
+                  'm3u8-proxy 规则，保存时自动转换。',
+                  style: TextStyle(
+                    color: AppleColors.labelSecondary,
+                    fontSize: 12.5,
+                    height: 1.4,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                TextSelectionMouseGuard(
+                  child: CupertinoTextField(
+                    controller: ctrl,
+                    maxLines: 14,
+                    minLines: 8,
+                    autocorrect: false,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12.5,
+                      fontFamily: 'Menlo',
+                    ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 10,
+                    ),
+                    decoration: BoxDecoration(
+                      color: AppleColors.groupedSecondary,
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: AppleCapsuleButton(
+                        label: '选择本地文件',
+                        primary: false,
+                        onPressed: () async {
+                          final result = await FilePicker.platform.pickFiles(
+                            type: FileType.any,
+                            withData: true,
+                          );
+                          final bytes =
+                              result?.files.isNotEmpty == true
+                                  ? result!.files.single.bytes
+                                  : null;
+                          if (bytes == null) return;
+                          final text = utf8.decode(bytes, allowMalformed: true);
+                          setModalState(() => ctrl.text = text);
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: AppleCapsuleButton(
+                        label: '恢复内置',
+                        primary: false,
+                        onPressed: saving
+                            ? null
+                            : () async {
+                                await widget.storage.setAdFilterRulesJson('');
+                                if (sheetCtx.mounted) {
+                                  Navigator.of(sheetCtx).pop();
+                                }
+                              },
+                      ),
+                    ),
+                  ],
+                ),
+                if (error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(
+                    error!,
+                    style: const TextStyle(
+                      color: AppleColors.systemRed,
+                      fontSize: 12.5,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 10),
+                AppleCapsuleButton(
+                  label: '保存',
+                  primary: true,
+                  onPressed: saving
+                      ? null
+                      : () async {
+                          final converted = RulesImporter.importText(ctrl.text);
+                          if (converted == null) {
+                            setModalState(() => error = '未识别的规则格式');
+                            return;
+                          }
+                          setModalState(() {
+                            saving = true;
+                            error = null;
+                          });
+                          await widget.storage.setAdFilterRulesJson(converted);
+                          if (sheetCtx.mounted) {
+                            Navigator.of(sheetCtx).pop();
+                          }
+                        },
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+    if (mounted) setState(() {});
   }
 
   Future<bool> _showEditSingleSiteDialog(

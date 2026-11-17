@@ -694,9 +694,16 @@ public class MoviePlayer {
     private AdFilterRules loadAdFilterRules() {
         android.content.SharedPreferences prefs = context.getSharedPreferences(Prefs.FILE, 0);
         if (!prefs.getBoolean(Prefs.AD_FILTER_ENABLED, true)) return AdFilterRules.empty();
+        AdFilterRules builtin =
+                prefs.getBoolean(Prefs.USE_BUILTIN_RULES, true)
+                        ? BuiltinAdRules.load(context)
+                        : AdFilterRules.empty();
         String stored = prefs.getString(Prefs.AD_FILTER_RULES_JSON, "");
-        if (stored != null && !stored.trim().isEmpty()) return AdFilterRules.parse(stored);
-        return BuiltinAdRules.load(context);
+        AdFilterRules custom =
+                (stored != null && !stored.trim().isEmpty())
+                        ? AdFilterRules.parse(stored)
+                        : AdFilterRules.empty();
+        return AdFilterRules.merge(builtin, custom);
     }
 
     private void startExoPrepare(
