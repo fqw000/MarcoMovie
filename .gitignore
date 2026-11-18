@@ -21,6 +21,12 @@ __pycache__/
 .env*
 local.properties
 *.log
+.DS_Store
+.git
+.github
+.git-blame-ignore-revs
+.gitattributes
+.gitmodules
 flutter/packages/catpaw_runtime/ios/Frameworks/
 flutter/packages/python_source_runtime/ios/Frameworks/
 
