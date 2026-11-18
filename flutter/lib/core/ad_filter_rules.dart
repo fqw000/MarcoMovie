@@ -27,6 +27,10 @@ class Heuristics {
   int maxAdBlockDurationSec = 30;
   int minAdBlockSegments = 2;
   int maxAdBlockSegments = 8;
+  int maxAdBlockTotalSec = 36;
+  bool requireStructural = true;
+  // Deprecated opt-in flags retained for JSON compatibility; the chunk scorer
+  // subsumes them.
   bool urlPrefixAnomaly = false;
   bool keyNoneSwitch = true;
   bool mirrorReuse = false;
@@ -162,6 +166,8 @@ class AdFilterRules {
             _optInt(heu, 'maxAdBlockDurationSec', 30);
         heuristics.minAdBlockSegments = _optInt(heu, 'minAdBlockSegments', 2);
         heuristics.maxAdBlockSegments = _optInt(heu, 'maxAdBlockSegments', 8);
+        heuristics.maxAdBlockTotalSec = _optInt(heu, 'maxAdBlockTotalSec', 36);
+        heuristics.requireStructural = _optBool(heu, 'requireStructural', true);
         heuristics.urlPrefixAnomaly = _optBool(heu, 'urlPrefixAnomaly', false);
         heuristics.keyNoneSwitch = _optBool(heu, 'keyNoneSwitch', true);
         heuristics.mirrorReuse = _optBool(heu, 'mirrorReuse', false);

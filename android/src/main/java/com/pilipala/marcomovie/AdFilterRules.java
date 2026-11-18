@@ -49,6 +49,9 @@ final class AdFilterRules {
         int maxAdBlockDurationSec = 30;
         int minAdBlockSegments = 2;
         int maxAdBlockSegments = 8;
+        int maxAdBlockTotalSec = 36;
+        boolean requireStructural = true;
+        // Deprecated opt-in flags retained for JSON compatibility; the chunk scorer subsumes them.
         boolean urlPrefixAnomaly = false;
         boolean keyNoneSwitch = true;
         boolean mirrorReuse = false;
@@ -201,6 +204,8 @@ final class AdFilterRules {
                 heuristics.maxAdBlockDurationSec = heu.optInt("maxAdBlockDurationSec", 30);
                 heuristics.minAdBlockSegments = heu.optInt("minAdBlockSegments", 2);
                 heuristics.maxAdBlockSegments = heu.optInt("maxAdBlockSegments", 8);
+                heuristics.maxAdBlockTotalSec = heu.optInt("maxAdBlockTotalSec", 36);
+                heuristics.requireStructural = heu.optBoolean("requireStructural", true);
                 heuristics.urlPrefixAnomaly = heu.optBoolean("urlPrefixAnomaly", false);
                 heuristics.keyNoneSwitch = heu.optBoolean("keyNoneSwitch", true);
                 heuristics.mirrorReuse = heu.optBoolean("mirrorReuse", false);

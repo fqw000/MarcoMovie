@@ -1,0 +1,2845 @@
+diff --git a/android/src/main/assets/adfilter/builtin_rules.json b/android/src/main/assets/adfilter/builtin_rules.json
+index 45ceeda..482b407 100644
+--- a/android/src/main/assets/adfilter/builtin_rules.json
++++ b/android/src/main/assets/adfilter/builtin_rules.json
+@@ -13,6 +13,7 @@
+   "playlistRules": [
+     {"type": "regex", "pattern": "/ad/"},
+     {"type": "regex", "pattern": "/ads/"},
++    {"type": "regex", "pattern": "/adv/"},
+     {"type": "regex", "pattern": "_ad_"},
+     {"type": "regex", "pattern": "_ads_"},
+     {"type": "regex", "pattern": "/adjump"},
+@@ -68,6 +69,8 @@
+     "maxAdBlockDurationSec": 30,
+     "minAdBlockSegments": 2,
+     "maxAdBlockSegments": 8,
++    "maxAdBlockTotalSec": 36,
++    "requireStructural": true,
+     "urlPrefixAnomaly": false,
+     "keyNoneSwitch": true,
+     "mirrorReuse": false,
+diff --git a/android/src/main/java/com/pilipala/marcomovie/AdFilterRules.java b/android/src/main/java/com/pilipala/marcomovie/AdFilterRules.java
+index 4d78d55..4dc2b52 100644
+--- a/android/src/main/java/com/pilipala/marcomovie/AdFilterRules.java
++++ b/android/src/main/java/com/pilipala/marcomovie/AdFilterRules.java
+@@ -49,6 +49,9 @@ final class AdFilterRules {
+         int maxAdBlockDurationSec = 30;
+         int minAdBlockSegments = 2;
+         int maxAdBlockSegments = 8;
++        int maxAdBlockTotalSec = 36;
++        boolean requireStructural = true;
++        // Deprecated opt-in flags retained for JSON compatibility; the chunk scorer subsumes them.
+         boolean urlPrefixAnomaly = false;
+         boolean keyNoneSwitch = true;
+         boolean mirrorReuse = false;
+@@ -201,6 +204,8 @@ final class AdFilterRules {
+                 heuristics.maxAdBlockDurationSec = heu.optInt("maxAdBlockDurationSec", 30);
+                 heuristics.minAdBlockSegments = heu.optInt("minAdBlockSegments", 2);
+                 heuristics.maxAdBlockSegments = heu.optInt("maxAdBlockSegments", 8);
++                heuristics.maxAdBlockTotalSec = heu.optInt("maxAdBlockTotalSec", 36);
++                heuristics.requireStructural = heu.optBoolean("requireStructural", true);
+                 heuristics.urlPrefixAnomaly = heu.optBoolean("urlPrefixAnomaly", false);
+                 heuristics.keyNoneSwitch = heu.optBoolean("keyNoneSwitch", true);
+                 heuristics.mirrorReuse = heu.optBoolean("mirrorReuse", false);
+diff --git a/android/src/main/java/com/pilipala/marcomovie/HeuristicAdDetector.java b/android/src/main/java/com/pilipala/marcomovie/HeuristicAdDetector.java
+index 97cb6b2..d268766 100644
+--- a/android/src/main/java/com/pilipala/marcomovie/HeuristicAdDetector.java
++++ b/android/src/main/java/com/pilipala/marcomovie/HeuristicAdDetector.java
+@@ -1,5 +1,7 @@
+ package com.pilipala.marcomovie;
+ 
++import java.util.ArrayList;
++import java.util.Arrays;
+ import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+@@ -8,200 +10,359 @@ import java.util.Map;
+ import java.util.Set;
+ 
+ /**
+- * Conservative heuristic ad-segment detection for media playlists whose ad inserts cannot be
+- * described by static rules or the industry-standard SCTE-35/CUE markers handled in {@link
+- * M3u8AdFilter}.
++ * Heuristic ad detection for media playlists, aligned with the validated {@code m3u8-adfilter}
++ * reference kernel.
+  *
+- * <p>The reliable signals (URL rules, SCTE/CUE markers, KEY-NONE clear blocks inside encrypted
+- * streams) are the default. The duration-window, URL-prefix and mirror-reuse detectors are too
+- * eager on real-world playlists, so they are opt-in and disabled by default; when enabled they
+- * require strong, bounded evidence rather than treating any short or repeated segment as an ad.
++ * <p>Reliable evidence (SCTE/CUE markers, URL rules, private comment markers) is handled directly
++ * by {@link M3u8AdFilter}; this class covers two weaker families. First, KEY-NONE clear blocks
++ * inside an encrypted stream are a strong signal and are removed outright. Second, segments are
++ * grouped into discontinuity-bounded chunks and scored from shape (uniform-short, short-between-
++ * long, dense-short) plus structural signals (discontinuity, off-host, naming deviation,
++ * naming/mirror reuse, sequence island). Weak shape signals must be corroborated by at least one
++ * structural signal before they may remove anything, so ordinary short blocks in content (burned-in
++ * captions, slow scenes) are not deleted.
+  */
+ final class HeuristicAdDetector {
+     private HeuristicAdDetector() {}
+ 
++    /* ---- scoring weights (aligned with the reference kernel) ---- */
++    private static final double W_UNIFORM_SHORT = 0.40;
++    private static final double W_SHORT_ONLY = 0.20;
++    private static final double W_DISC = 0.15;
++    private static final double W_OFF_HOST = 0.15;
++    private static final double W_URL_DEV = 0.10;
++    private static final double W_SHORT_BETWEEN_LONG = 0.20;
++    private static final double W_NAMING_REUSE = 0.25;
++    private static final double W_DENSE_SHORT = 0.10;
++    private static final double W_SEQ_ISLAND = 0.08;
++    private static final double W_SINGLE = -0.30;
++    private static final double W_LONG = -0.20;
++    private static final double W_TOTAL = -0.30;
++
++    private static final double BASE_THRESHOLD = 0.60;
++    private static final double FIRST_BONUS = 0.20;
++    private static final double LAST_BONUS = 0.10;
++    private static final double UNIFORM_TOLERANCE = 0.8;
++
++    /** Structural (non-duration) signals required to corroborate a weak shape-only hit. */
++    private static final List<String> STRUCTURAL_NOTES =
++            Arrays.asList(
++                    "disc", "offhost", "url-dev", "naming-reuse", "mirror-reuse", "seq-island");
++
+     static Set<Integer> detect(
+-            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg, boolean encrypted) {
+-        Set<Integer> remove = new HashSet<>();
+-        if (cfg == null || !cfg.enabled || segments == null || segments.isEmpty()) return remove;
+-
+-        // Removing segments inside an encrypted stream shifts implicit IVs, so only the clear-block
+-        // detector is safe there. The remaining detectors run on clear streams only.
+-        if (encrypted) {
+-            if (cfg.keyNoneSwitch) remove.addAll(detectKeyNoneSwitch(segments, cfg));
+-            return remove;
+-        }
+-        if (cfg.urlPrefixAnomaly) remove.addAll(detectHostAnomaly(segments, cfg));
+-        if (cfg.mirrorReuse) remove.addAll(detectMirrorReuse(segments, cfg));
+-        if (cfg.durationWindows) remove.addAll(detectDurationWindows(segments, cfg));
+-        return remove;
++            List<M3u8AdFilter.Node> nodes,
++            AdFilterRules.Heuristics cfg,
++            String playlistHost,
++            boolean encrypted) {
++        Set<Integer> drop = new HashSet<>();
++        if (nodes == null || nodes.isEmpty()) return drop;
++
++        int minSegments = cfg == null ? 2 : cfg.minAdBlockSegments;
++        int maxSegments = cfg == null ? 8 : cfg.maxAdBlockSegments;
++        int minDur = cfg == null ? 4 : cfg.minAdBlockDurationSec;
++        int maxTotal = cfg == null ? 36 : cfg.maxAdBlockTotalSec;
++        boolean requireStructural = cfg == null ? true : cfg.requireStructural;
++        boolean keyNone = cfg == null ? true : cfg.keyNoneSwitch;
++
++        // KEY-NONE: a clear block inside an otherwise encrypted stream is strong evidence.
++        if (encrypted && keyNone) detectKeyNone(nodes, minSegments, maxSegments, drop);
++
++        // Naming / mirror reuse evidence (clear streams only, to avoid key-URI reuse confusion).
++        if (!encrypted) detectReuse(nodes, cfg == null ? 30 : cfg.maxAdBlockDurationSec);
++
++        // Discontinuity-bounded chunk scoring.
++        List<List<M3u8AdFilter.Node>> chunks = buildChunks(nodes);
++        Context ctx = buildContext(nodes, chunks);
++        for (int i = 0; i < chunks.size(); i++) {
++            List<M3u8AdFilter.Node> chunk = chunks.get(i);
++            boolean hit =
++                    scoreChunk(
++                            chunk,
++                            i,
++                            chunks,
++                            ctx,
++                            minSegments,
++                            maxSegments,
++                            minDur,
++                            maxTotal,
++                            requireStructural);
++            if (hit) {
++                for (M3u8AdFilter.Node n : chunk) drop.add(n.index);
++            }
++        }
++        return drop;
+     }
+ 
+-    private static boolean isClear(M3u8AdFilter.Segment segment) {
+-        return segment.keyMethod == null || "NONE".equals(segment.keyMethod);
++    /* ---------------------------------------------------------------- context */
++
++    private static final class Context {
++        String dominantHost;
++        String dominantKey;
++        double medianDur;
++        double avgChunkSize;
+     }
+ 
+-    /** Removes contiguous clear blocks that sit inside an otherwise encrypted stream. */
+-    private static Set<Integer> detectKeyNoneSwitch(
+-            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
+-        Set<Integer> remove = new HashSet<>();
+-        int start = 0;
+-        while (start < segments.size()) {
+-            if (!isClear(segments.get(start))) {
+-                start++;
+-                continue;
++    private static Context buildContext(
++            List<M3u8AdFilter.Node> nodes, List<List<M3u8AdFilter.Node>> chunks) {
++        Context ctx = new Context();
++        List<String> hosts = new ArrayList<>();
++        for (M3u8AdFilter.Node n : nodes) {
++            String h = hostOf(n.uri);
++            if (h != null) hosts.add(h);
++        }
++        ctx.dominantHost = hosts.size() >= nodes.size() * 0.5 ? mode(hosts) : null;
++
++        List<String> keys = new ArrayList<>();
++        for (M3u8AdFilter.Node n : nodes) {
++            String k = namingKey(n.uri);
++            if (!k.isEmpty()) keys.add(k);
++        }
++        ctx.dominantKey = mode(keys);
++
++        List<Float> durs = new ArrayList<>();
++        for (M3u8AdFilter.Node n : nodes) if (n.dur > 0f) durs.add(n.dur);
++        ctx.medianDur = median(durs);
++        ctx.avgChunkSize = chunks.isEmpty() ? nodes.size() : (double) nodes.size() / chunks.size();
++        return ctx;
++    }
++
++    /* ---------------------------------------------------------------- chunks */
++
++    private static List<List<M3u8AdFilter.Node>> buildChunks(List<M3u8AdFilter.Node> nodes) {
++        List<List<M3u8AdFilter.Node>> chunks = new ArrayList<>();
++        List<M3u8AdFilter.Node> cur = new ArrayList<>();
++        M3u8AdFilter.Node prev = null;
++        for (M3u8AdFilter.Node n : nodes) {
++            boolean boundary = false;
++            if (!cur.isEmpty() && prev != null) {
++                if (n.hasDisc) boundary = true;
++                else if (!java.util.Objects.equals(n.keyRaw, prev.keyRaw)) boundary = true;
++                else if (n.scte != prev.scte) boundary = true;
++                else {
++                    double jump = Math.abs((double) n.dur - prev.dur);
++                    double scale = Math.max(3.0, 0.35 * Math.max(n.dur, prev.dur));
++                    if (jump >= scale) boundary = true;
++                }
+             }
+-            int end = start;
+-            while (end < segments.size() && isClear(segments.get(end))) end++;
+-            int length = end - start;
+-            boolean boundedLeft = start > 0 && !isClear(segments.get(start - 1));
+-            boolean boundedRight = end < segments.size() && !isClear(segments.get(end));
+-            if (length >= cfg.minAdBlockSegments
+-                    && length <= cfg.maxAdBlockSegments
+-                    && (boundedLeft || boundedRight)) {
+-                for (int i = start; i < end; i++) remove.add(i);
++            if (boundary) {
++                chunks.add(cur);
++                cur = new ArrayList<>();
+             }
+-            start = end;
++            cur.add(n);
++            prev = n;
+         }
+-        return remove;
++        if (!cur.isEmpty()) chunks.add(cur);
++        return chunks;
+     }
+ 
+-    /**
+-     * Removes short contiguous runs served from a different host than the playlist's dominant host,
+-     * only when the run is bounded on both sides by the dominant host (classic ad-CD insert).
+-     */
+-    private static Set<Integer> detectHostAnomaly(
+-            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
+-        Set<Integer> remove = new HashSet<>();
+-        String dominantHost = dominantHost(segments);
+-        if (dominantHost == null || dominantHost.isEmpty()) return remove;
+-        int start = 0;
+-        while (start < segments.size()) {
+-            if (dominantHost.equals(hostOf(segments.get(start).uri))) {
+-                start++;
+-                continue;
++    private static boolean scoreChunk(
++            List<M3u8AdFilter.Node> chunk,
++            int idx,
++            List<List<M3u8AdFilter.Node>> chunks,
++            Context ctx,
++            int minSegments,
++            int maxSegments,
++            int minDur,
++            int maxTotal,
++            boolean requireStructural) {
++        int n = chunk.size();
++        float total = 0f;
++        float min = Float.MAX_VALUE;
++        float max = 0f;
++        for (M3u8AdFilter.Node node : chunk) {
++            total += node.dur;
++            if (node.dur < min) min = node.dur;
++            if (node.dur > max) max = node.dur;
++        }
++        boolean uniform = n >= 2 && (max - min) <= UNIFORM_TOLERANCE;
++        boolean shortShape = min >= minDur && total <= maxTotal;
++
++        int namingReuseCount = 0, mirrorReuseCount = 0;
++        boolean offHost = false, urlDev = false;
++        for (M3u8AdFilter.Node node : chunk) {
++            if (node.namingReuse) namingReuseCount++;
++            if (node.mirrorReuse) mirrorReuseCount++;
++            if (ctx.dominantHost != null) {
++                String h = hostOf(node.uri);
++                if (h != null && !h.equals(ctx.dominantHost)) offHost = true;
+             }
+-            int end = start;
+-            while (end < segments.size() && !dominantHost.equals(hostOf(segments.get(end).uri)))
+-                end++;
+-            int length = end - start;
+-            boolean boundedLeft =
+-                    start > 0 && dominantHost.equals(hostOf(segments.get(start - 1).uri));
+-            boolean boundedRight =
+-                    end < segments.size() && dominantHost.equals(hostOf(segments.get(end).uri));
+-            if (length >= cfg.minAdBlockSegments
+-                    && length <= cfg.maxAdBlockSegments
+-                    && boundedLeft
+-                    && boundedRight) {
+-                for (int i = start; i < end; i++) remove.add(i);
++            if (ctx.dominantKey != null && !ctx.dominantKey.isEmpty()) {
++                if (!namingKey(node.uri).equals(ctx.dominantKey)) urlDev = true;
+             }
+-            start = end;
+         }
+-        return remove;
+-    }
+ 
+-    /**
+-     * Removes every occurrence of a URI that repeats heavily (ad-loop evidence) while the rest of
+-     * the playlist is mostly unique. Requires at least three repeats, at least four distinct URIs,
+-     * and short segment durations so ordinary repeated placeholders do not match.
+-     */
+-    private static Set<Integer> detectMirrorReuse(
+-            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
+-        Set<Integer> remove = new HashSet<>();
+-        Map<String, Integer> counts = new HashMap<>();
+-        for (M3u8AdFilter.Segment segment : segments) {
+-            if (segment.uri == null || segment.uri.isEmpty()) continue;
+-            Integer seen = counts.get(segment.uri);
+-            counts.put(segment.uri, (seen == null ? 0 : seen) + 1);
+-        }
+-        if (counts.size() < 4) return remove;
+-        for (int i = 0; i < segments.size(); i++) {
+-            M3u8AdFilter.Segment segment = segments.get(i);
+-            if (segment.uri == null || segment.uri.isEmpty()) continue;
+-            Integer seen = counts.get(segment.uri);
+-            if (seen != null
+-                    && seen >= 3
+-                    && segment.durationSec > 0f
+-                    && segment.durationSec <= cfg.maxAdBlockDurationSec) {
+-                remove.add(i);
++        List<String> notes = new ArrayList<>();
++        double score = 0;
++        if (shortShape && uniform) {
++            score += W_UNIFORM_SHORT;
++            notes.add("uniform-short");
++        } else if (shortShape) {
++            score += W_SHORT_ONLY;
++            notes.add("short");
++        }
++        if (n < minSegments) {
++            score += W_SINGLE;
++            notes.add("single");
++        }
++        if (n > maxSegments) {
++            score += W_LONG;
++            notes.add("long" + n);
++        }
++        if (total > 90) {
++            score += W_TOTAL;
++            notes.add("total>90s");
++        }
++        if (!chunk.isEmpty() && chunk.get(0).hasDisc) {
++            score += W_DISC;
++            notes.add("disc");
++        }
++        if (offHost) {
++            score += W_OFF_HOST;
++            notes.add("offhost");
++        }
++        if (urlDev) {
++            score += W_URL_DEV;
++            notes.add("url-dev");
++        }
++        if (namingReuseCount * 2 >= n) {
++            score += W_NAMING_REUSE;
++            notes.add("naming-reuse");
++        }
++        if (mirrorReuseCount * 2 >= n) {
++            score += W_NAMING_REUSE;
++            notes.add("mirror-reuse");
++        }
++        if (idx > 0 && idx < chunks.size() - 1) {
++            List<M3u8AdFilter.Node> prevChunk = chunks.get(idx - 1);
++            List<M3u8AdFilter.Node> nextChunk = chunks.get(idx + 1);
++            if (!prevChunk.isEmpty() && !nextChunk.isEmpty()) {
++                float prevDur = prevChunk.get(prevChunk.size() - 1).dur;
++                float nextDur = nextChunk.get(0).dur;
++                if (prevDur >= 1.5 * max && nextDur >= 1.5 * max) {
++                    score += W_SHORT_BETWEEN_LONG;
++                    notes.add("short-between-long");
++                }
++                String curKey = modeKey(chunk);
++                String pk = modeKey(prevChunk);
++                String nk = modeKey(nextChunk);
++                if (!curKey.isEmpty()
++                        && !pk.isEmpty()
++                        && !nk.isEmpty()
++                        && !curKey.equals(pk)
++                        && !curKey.equals(nk)) {
++                    score += W_SEQ_ISLAND;
++                    notes.add("seq-island");
++                }
+             }
+         }
+-        return remove;
++        if (ctx.medianDur > 0
++                && ctx.medianDur <= 5
++                && uniform
++                && n >= 2 * Math.max(1, (int) Math.round(ctx.avgChunkSize))) {
++            score += W_DENSE_SHORT;
++            notes.add("dense-short");
++        }
++
++        double threshold =
++                BASE_THRESHOLD
++                        + (idx == 0 ? FIRST_BONUS : 0)
++                        + (idx == chunks.size() - 1 ? LAST_BONUS : 0);
++        boolean hit = score >= threshold;
++        if (hit && requireStructural && !hasStructural(notes)) {
++            hit = false;
++        }
++        return hit;
++    }
++
++    private static boolean hasStructural(List<String> notes) {
++        for (String note : notes) if (STRUCTURAL_NOTES.contains(note)) return true;
++        return false;
+     }
+ 
+-    /**
+-     * Removes a short, uniformly-timed block of segments (2..{@code maxAdBlockSegments}) that is
+-     * bounded on both sides by clearly longer content, with no discontinuity inside. Disabled by
+-     * default: segment duration alone is an unreliable ad signal in HLS.
+-     */
+-    private static Set<Integer> detectDurationWindows(
+-            List<M3u8AdFilter.Segment> segments, AdFilterRules.Heuristics cfg) {
+-        Set<Integer> remove = new HashSet<>();
++    private static String modeKey(List<M3u8AdFilter.Node> chunk) {
++        List<String> keys = new ArrayList<>();
++        for (M3u8AdFilter.Node node : chunk) {
++            String k = namingKey(node.uri);
++            if (!k.isEmpty()) keys.add(k);
++        }
++        return mode(keys);
++    }
++
++    /* ---------------------------------------------------------------- keynone */
++
++    private static void detectKeyNone(
++            List<M3u8AdFilter.Node> nodes, int minSegments, int maxSegments, Set<Integer> drop) {
+         int start = 0;
+-        while (start < segments.size()) {
+-            if (!isAdLikeDuration(segments.get(start), cfg)) {
++        while (start < nodes.size()) {
++            if (!isClear(nodes.get(start))) {
+                 start++;
+                 continue;
+             }
+             int end = start;
+-            while (end < segments.size() && isAdLikeDuration(segments.get(end), cfg)) end++;
++            while (end < nodes.size() && isClear(nodes.get(end))) end++;
+             int length = end - start;
+-            boolean boundedLeft = start > 0 && isLongContent(segments.get(start - 1), cfg);
+-            boolean boundedRight = end < segments.size() && isLongContent(segments.get(end), cfg);
+-            boolean noDiscontinuity = true;
+-            for (int i = start; i < end; i++) {
+-                if (segments.get(i).discontinuityBefore > 0) {
+-                    noDiscontinuity = false;
+-                    break;
+-                }
+-            }
+-            if (length >= cfg.minAdBlockSegments
+-                    && length <= cfg.maxAdBlockSegments
+-                    && boundedLeft
+-                    && boundedRight
+-                    && noDiscontinuity) {
+-                for (int i = start; i < end; i++) remove.add(i);
++            boolean left = start > 0 && !isClear(nodes.get(start - 1));
++            boolean right = end < nodes.size() && !isClear(nodes.get(end));
++            if (length >= minSegments && length <= maxSegments && (left || right)) {
++                for (int i = start; i < end; i++) drop.add(nodes.get(i).index);
+             }
+             start = end;
+         }
+-        return remove;
+     }
+ 
+-    private static boolean isAdLikeDuration(
+-            M3u8AdFilter.Segment segment, AdFilterRules.Heuristics cfg) {
+-        float duration = segment.durationSec;
+-        return duration >= cfg.minAdBlockDurationSec && duration <= cfg.maxAdBlockDurationSec;
++    private static boolean isClear(M3u8AdFilter.Node n) {
++        return n.keyMethod == null || "NONE".equals(n.keyMethod);
+     }
+ 
+-    private static boolean isLongContent(
+-            M3u8AdFilter.Segment segment, AdFilterRules.Heuristics cfg) {
+-        return segment.durationSec > cfg.maxAdBlockDurationSec;
+-    }
++    /* ---------------------------------------------------------------- reuse */
+ 
+-    private static String dominantHost(List<M3u8AdFilter.Segment> segments) {
+-        Map<String, Integer> hosts = new HashMap<>();
+-        for (M3u8AdFilter.Segment segment : segments) {
+-            String host = hostOf(segment.uri);
+-            if (host == null || host.isEmpty()) continue;
+-            Integer seen = hosts.get(host);
+-            hosts.put(host, (seen == null ? 0 : seen) + 1);
++    private static void detectReuse(List<M3u8AdFilter.Node> nodes, int maxDur) {
++        Map<String, Integer> uriCount = new HashMap<>();
++        Map<String, Integer> keyCount = new HashMap<>();
++        for (M3u8AdFilter.Node n : nodes) {
++            uriCount.put(n.uri, uriCount.getOrDefault(n.uri, 0) + 1);
++            String k = namingKey(n.uri);
++            if (!k.isEmpty()) keyCount.put(k, keyCount.getOrDefault(k, 0) + 1);
+         }
+-        String best = null;
+-        int bestCount = 0;
+-        for (Map.Entry<String, Integer> entry : hosts.entrySet()) {
+-            if (entry.getValue() > bestCount) {
+-                best = entry.getKey();
+-                bestCount = entry.getValue();
++        for (M3u8AdFilter.Node n : nodes) {
++            if (uriCount.size() >= 4 && uriCount.getOrDefault(n.uri, 0) >= 3 && n.dur <= maxDur) {
++                n.mirrorReuse = true;
++            }
++            String k = namingKey(n.uri);
++            if (!k.isEmpty()
++                    && keyCount.size() >= 3
++                    && keyCount.getOrDefault(k, 0) >= 3
++                    && n.dur <= maxDur) {
++                n.namingReuse = true;
+             }
+         }
+-        return best;
+     }
+ 
+-    /** Extracts the host portion of an absolute {@code http(s)://host[:port]/...} URL. */
++    /* ---------------------------------------------------------------- helpers */
++
++    private static String namingKey(String uri) {
++        if (uri == null) return "";
++        String p = uri;
++        int scheme = p.indexOf("://");
++        if (scheme >= 0) {
++            int hostStart = scheme + 3;
++            int slash = p.indexOf('/', hostStart);
++            if (slash >= 0) p = p.substring(slash);
++        }
++        int q = p.indexOf('?');
++        int h = p.indexOf('#');
++        int cut = p.length();
++        if (q >= 0 && q < cut) cut = q;
++        if (h >= 0 && h < cut) cut = h;
++        p = p.substring(0, cut);
++        return p.replaceAll("\\d+", "#").toLowerCase(Locale.ROOT);
++    }
++
+     private static String hostOf(String uri) {
+         if (uri == null) return null;
+         int scheme = uri.indexOf("://");
+-        int start = scheme >= 0 ? scheme + 3 : 0;
++        if (scheme < 0) return null; // relative URI carries no host
++        int start = scheme + 3;
+         int end = start;
+         while (end < uri.length()) {
+             char c = uri.charAt(end);
+@@ -211,4 +372,30 @@ final class HeuristicAdDetector {
+         String host = uri.substring(start, end).trim();
+         return host.isEmpty() ? null : host.toLowerCase(Locale.ROOT);
+     }
++
++    private static String mode(List<String> values) {
++        Map<String, Integer> counts = new HashMap<>();
++        for (String v : values) {
++            if (v == null || v.isEmpty()) continue;
++            counts.put(v, counts.getOrDefault(v, 0) + 1);
++        }
++        String best = "";
++        int bestCount = 0;
++        for (Map.Entry<String, Integer> e : counts.entrySet()) {
++            if (e.getValue() > bestCount) {
++                best = e.getKey();
++                bestCount = e.getValue();
++            }
++        }
++        return best;
++    }
++
++    private static double median(List<Float> values) {
++        if (values == null || values.isEmpty()) return 0;
++        float[] a = new float[values.size()];
++        for (int i = 0; i < values.size(); i++) a[i] = values.get(i);
++        Arrays.sort(a);
++        int m = a.length >> 1;
++        return a.length % 2 == 1 ? a[m] : (a[m - 1] + a[m]) / 2.0;
++    }
+ }
+diff --git a/android/src/main/java/com/pilipala/marcomovie/M3u8AdFilter.java b/android/src/main/java/com/pilipala/marcomovie/M3u8AdFilter.java
+index fc43b44..2aa8f84 100644
+--- a/android/src/main/java/com/pilipala/marcomovie/M3u8AdFilter.java
++++ b/android/src/main/java/com/pilipala/marcomovie/M3u8AdFilter.java
+@@ -2,86 +2,183 @@ package com.pilipala.marcomovie;
+ 
+ import java.util.ArrayList;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.Set;
+ 
+ /**
+- * Pure-Java HLS media-playlist filter. Removes ad segments matched by {@link AdFilterRules} and
+- * by {@link HeuristicAdDetector}, then rebuilds a structurally valid playlist.
++ * Pure-Java HLS media-playlist filter, aligned with the validated {@code m3u8-adfilter} reference
++ * kernel. It parses the playlist into segment nodes, applies structural gates (master / live /
++ * implicit-IV), marks strong ad evidence (SCTE-35/CUE, URL rules, private comment markers, KEY-NONE
++ * clear blocks), then scores discontinuity-bounded chunks. Weak shape signals must be corroborated
++ * by a structural signal before they may remove anything. The playlist is rebuilt with structural
++ * conservation (KEY continuity, seam DISCONTINUITY merge, CUE pairing) and self-verified; any
++ * invariant violation rolls the whole edit back.
+  *
+  * <p>This class has no Android or Media3 dependency so it can be exercised by the offline JVM
+  * checks under {@code android/tests}.
+  */
+ final class M3u8AdFilter {
+-    static final class Segment {
++
++    /** Private comment markers left by ad-stitching systems, e.g. {@code # ppvod-ad-injected v1}. */
++    private static final java.util.regex.Pattern AD_COMMENT =
++            java.util.regex.Pattern.compile(
++                    "(?i)(ad[-_]?(inject|insert|mark|marker)|ppvod|guanggao|adseg|插播|广告)");
++
++    static final class Node {
++        int index;
++        String extinf;
+         String uri;
+-        float durationSec;
++        float dur;
+         String keyMethod; // null = no KEY seen, "NONE", or e.g. "AES-128"
+-        int discontinuityBefore; // #EXT-X-DISCONTINUITY markers since previous segment
+-        boolean scteAd; // inside a #EXT-X-CUE-OUT/IN or SCTE-35 marked ad break
+-        int extinfLine;
+-        int uriLine;
+-        boolean removed;
++        String keyRaw; // raw #EXT-X-KEY line, for structural conservation
++        boolean hasDisc; // #EXT-X-DISCONTINUITY seen before this node
++        boolean scte; // inside a CUE-OUT/IN or SCTE-35 marked ad break
++        boolean adComment; // private ad-injection comment seen before this node
++        List<String> tags; // other tag lines (CUE, DATERANGE, comments) kept for rebuild
++        boolean ruleHit; // segment URI matched by rules
++        boolean keynone; // clear segment inside an otherwise encrypted stream
++        boolean namingReuse; // naming-key reuse evidence
++        boolean mirrorReuse; // exact URI reuse evidence
++        String reason; // human-readable evidence, for diagnostics
++        boolean dropped;
+     }
+ 
+     static final class Result {
+         final String text;
+         final int removedSegments;
++        final String reason;
+ 
+-        Result(String text, int removedSegments) {
++        Result(String text, int removedSegments, String reason) {
+             this.text = text;
+             this.removedSegments = removedSegments;
++            this.reason = reason;
++        }
++    }
++
++    private static final class Parsed {
++        List<String> head;
++        List<Node> nodes;
++        List<String> tail;
++        boolean implicitIv;
++        boolean encrypted;
++
++        Parsed(
++                List<String> head,
++                List<Node> nodes,
++                List<String> tail,
++                boolean implicitIv,
++                boolean encrypted) {
++            this.head = head;
++            this.nodes = nodes;
++            this.tail = tail;
++            this.implicitIv = implicitIv;
++            this.encrypted = encrypted;
+         }
+     }
+ 
+     private M3u8AdFilter() {}
+ 
+     static Result filter(String m3u8, String playlistHost, AdFilterRules rules) {
+-        if (m3u8 == null || m3u8.isEmpty()) return new Result(m3u8 == null ? "" : m3u8, 0);
++        if (m3u8 == null || m3u8.trim().isEmpty()) {
++            return new Result(m3u8 == null ? "" : m3u8, 0, "empty");
++        }
+         List<String> lines = splitLines(m3u8);
+         if (lines.isEmpty() || !lines.get(0).trim().startsWith("#EXTM3U")) {
+-            return new Result(m3u8, 0);
++            return new Result(m3u8, 0, "not-m3u8");
+         }
+-        if (isMasterPlaylist(lines)) return new Result(m3u8, 0);
+ 
+-        List<Segment> segments = parseSegments(lines);
+-        if (segments.isEmpty()) return new Result(m3u8, 0);
++        Parsed parsed = parse(lines);
++        if (parsed.head.isEmpty() && parsed.nodes.isEmpty())
++            return new Result(m3u8, 0, "no-content");
+ 
+-        boolean encrypted = isEncrypted(segments);
++        // Master playlists are never edited; the variant media playlist is filtered instead.
++        if (isMaster(parsed.head)) return new Result(m3u8, 0, "master");
+ 
+-        // Rule-based and SCTE/CUE removal are only safe for clear streams: deleting a segment in
+-        // the middle of an AES-128 stream shifts the implicit IV of every following segment and
+-        // breaks decryption.
+-        if (!encrypted) {
+-            for (Segment segment : segments) {
+-                if (segment.scteAd || rules.matchesSegment(playlistHost, segment.uri)) {
+-                    segment.removed = true;
+-                }
++        // Live / EVENT playlists have a sliding window; deleting segments breaks sequence math.
++        if (!hasEndList(parsed.tail) && !containsLine(m3u8, "#EXT-X-ENDLIST")) {
++            return new Result(m3u8, 0, "live-no-endlist");
++        }
++
++        // AES-128 / SAMPLE-AES without an explicit IV derives each IV from the segment sequence
++        // number, so removing any segment shifts every following IV and breaks decryption. The only
++        // safe action is to leave the whole playlist untouched.
++        if (parsed.implicitIv) return new Result(m3u8, 0, "aes-implicit-iv");
++
++        if (parsed.nodes.isEmpty()) return new Result(m3u8, 0, "no-segments");
++
++        AdFilterRules.Heuristics heu = rules == null ? null : rules.heuristics;
++
++        // Reliable per-segment evidence: URL rules and SCTE/CUE markers. These are unambiguous and
++        // always run, independent of the heuristic switch. Safe on clear and explicit-IV streams
++        // (implicit-IV was gated out above).
++        for (Node node : parsed.nodes) {
++            if (rules != null && rules.matchesSegment(playlistHost, node.uri)) {
++                node.ruleHit = true;
++                node.dropped = true;
++                node.reason = "rule";
++            }
++            if (node.scte) {
++                node.dropped = true;
++                node.reason = first(node.reason, "scte");
+             }
+         }
+ 
+-        if (rules.heuristics != null && rules.heuristics.enabled) {
+-            Set<Integer> heuristic =
+-                    HeuristicAdDetector.detect(segments, rules.heuristics, encrypted);
+-            for (Integer index : heuristic) {
+-                if (index >= 0 && index < segments.size()) segments.get(index).removed = true;
++        // Private comment markers (AD-02) mark the whole discontinuity-bounded block, e.g.
++        // "# ppvod-ad-injected v1" immediately before a DISCONTINUITY-bounded ad pod.
++        for (int i = 0; i < parsed.nodes.size(); i++) {
++            Node marker = parsed.nodes.get(i);
++            if (!marker.adComment) continue;
++            int j = i;
++            while (j < parsed.nodes.size()) {
++                if (j > i && parsed.nodes.get(j).hasDisc) break; // closing boundary
++                Node block = parsed.nodes.get(j);
++                block.dropped = true;
++                if (block.reason == null) block.reason = "ad-comment";
++                j++;
+             }
+         }
+ 
+-        int removedCount = 0;
+-        for (Segment segment : segments) {
+-            if (segment.removed) removedCount++;
++        // Heuristic chunk detection (KEY-NONE clear blocks + discontinuity-bounded shape scoring).
++        if (heu == null || heu.enabled) {
++            Set<Integer> dropped =
++                    HeuristicAdDetector.detect(parsed.nodes, heu, playlistHost, parsed.encrypted);
++            for (int i : dropped) {
++                Node n = parsed.nodes.get(i);
++                n.dropped = true;
++                if (n.reason == null) n.reason = "heuristic";
++            }
+         }
+-        if (removedCount == 0) return new Result(m3u8, 0);
+ 
+-        return new Result(rebuild(lines, segments, removedCount), removedCount);
++        int removed = 0;
++        for (Node n : parsed.nodes) if (n.dropped) removed++;
++        if (removed == 0) return new Result(m3u8, 0, "clean");
++
++        // Safety cap: a single small block is always allowed, but a large deletion is suspicious.
++        int maxBlock = heu == null ? 8 : heu.maxAdBlockSegments;
++        float removedDur = 0f;
++        for (Node n : parsed.nodes) if (n.dropped) removedDur += n.dur;
++        float ratio = parsed.nodes.isEmpty() ? 0f : (float) removed / parsed.nodes.size();
++        if (removed > maxBlock && (ratio > 0.15f || removedDur > 120f)) {
++            return new Result(m3u8, 0, "revert-over-cap");
++        }
++
++        String rebuilt = rebuild(parsed);
++        String verified = verifyAndFallback(m3u8, rebuilt, parsed.nodes.size() - removed);
++        if (verified == null) return new Result(m3u8, 0, "revert-invariant");
++        return new Result(verified, removed, "changed");
++    }
++
++    private static String first(String a, String b) {
++        return a == null ? b : a + "+" + b;
+     }
+ 
++    /* ------------------------------------------------------------------ parsing */
++
+     private static List<String> splitLines(String text) {
+         List<String> lines = new ArrayList<>();
+         int start = 0;
+         for (int i = 0; i < text.length(); i++) {
+-            char ch = text.charAt(i);
+-            if (ch == '\n') {
++            if (text.charAt(i) == '\n') {
+                 int end = i;
+                 if (end > start && text.charAt(end - 1) == '\r') end--;
+                 lines.add(text.substring(start, end));
+@@ -96,69 +193,147 @@ final class M3u8AdFilter {
+         return lines;
+     }
+ 
+-    private static boolean isMasterPlaylist(List<String> lines) {
+-        for (String line : lines) {
+-            if (line.trim().startsWith("#EXT-X-STREAM-INF")) return true;
+-        }
++    private static boolean isMaster(List<String> head) {
++        for (String line : head) if (line.trim().startsWith("#EXT-X-STREAM-INF")) return true;
++        return false;
++    }
++
++    private static boolean hasEndList(List<String> tail) {
++        for (String line : tail) if (line.trim().startsWith("#EXT-X-ENDLIST")) return true;
+         return false;
+     }
+ 
+-    private static List<Segment> parseSegments(List<String> lines) {
+-        List<Segment> segments = new ArrayList<>();
+-        String currentKey = null;
+-        int pendingDiscontinuity = 0;
+-        boolean inScteAd = false;
+-        for (int i = 1; i < lines.size(); i++) {
+-            String trimmed = lines.get(i).trim();
+-            if (trimmed.startsWith("#EXT-X-KEY:")) {
+-                currentKey = parseKeyMethod(trimmed);
++    private static boolean containsLine(String text, String needle) {
++        return text.indexOf(needle) >= 0;
++    }
++
++    private static Parsed parse(List<String> lines) {
++        List<String> head = new ArrayList<>();
++        List<Node> nodes = new ArrayList<>();
++        List<String> tail = new ArrayList<>();
++
++        List<String> pending = new ArrayList<>();
++        String currentKeyRaw = null;
++        String currentKeyMethod = null;
++        boolean implicitIv = false;
++        boolean encrypted = false;
++        boolean inScte = false;
++        boolean pendingAdComment = false;
++        String pendingExtinf = null;
++        boolean seenSegment = false;
++
++        for (String line : lines) {
++            String t = line.trim();
++            if (t.isEmpty()) continue;
++
++            if (t.startsWith("#EXTINF:")) {
++                pendingExtinf = t;
++                continue;
++            }
++
++            if (!t.startsWith("#")) {
++                if (pendingExtinf != null) {
++                    Node node = new Node();
++                    node.index = nodes.size();
++                    node.extinf = pendingExtinf;
++                    node.uri = t;
++                    node.dur = parseDuration(pendingExtinf);
++                    node.keyRaw = currentKeyRaw;
++                    node.keyMethod = currentKeyMethod;
++                    node.scte = inScte;
++                    node.adComment = pendingAdComment;
++                    node.tags = new ArrayList<>(pending);
++                    pending.clear();
++                    pendingAdComment = false;
++                    pendingExtinf = null;
++                    seenSegment = true;
++                    nodes.add(node);
++                } else {
++                    head.addAll(pending);
++                    head.add(t);
++                    pending.clear();
++                }
++                continue;
++            }
++
++            if (!seenSegment && pendingExtinf == null && isGlobalHead(t)) {
++                head.add(t);
++                continue;
++            }
++            if (t.startsWith("#EXT-X-KEY:")) {
++                currentKeyRaw = t;
++                currentKeyMethod = parseKeyMethod(t);
++                if ((isAes(currentKeyMethod)) && !hasIv(t)) implicitIv = true;
++                if (currentKeyMethod != null && !"NONE".equals(currentKeyMethod)) encrypted = true;
++                continue;
++            }
++            if (t.startsWith("#EXT-X-DISCONTINUITY")) {
++                pending.add(t);
+                 continue;
+             }
+-            if (trimmed.startsWith("#EXT-X-DISCONTINUITY")) {
+-                pendingDiscontinuity++;
++            if (isScteStart(t)) {
++                inScte = true;
++                pending.add(t);
+                 continue;
+             }
+-            if (isScteAdStart(trimmed)) {
+-                inScteAd = true;
++            if (t.startsWith("#EXT-X-CUE-IN")) {
++                inScte = false;
++                pending.add(t);
+                 continue;
+             }
+-            if (trimmed.startsWith("#EXT-X-CUE-IN")) {
+-                inScteAd = false;
++            // Private comment markers (AD-02): "# ppvod-ad-injected v1" etc.
++            if (t.charAt(0) == '#' && !t.startsWith("#EXT") && AD_COMMENT.matcher(t).find()) {
++                pendingAdComment = true;
++                pending.add(t);
+                 continue;
+             }
+-            if (!trimmed.startsWith("#EXTINF:")) continue;
+-            int uriLine = -1;
+-            for (int j = i + 1; j < lines.size(); j++) {
+-                String next = lines.get(j).trim();
+-                if (next.isEmpty() || next.startsWith("#")) continue;
+-                uriLine = j;
+-                break;
+-            }
+-            if (uriLine == -1) continue;
+-            Segment segment = new Segment();
+-            segment.extinfLine = i;
+-            segment.uriLine = uriLine;
+-            segment.uri = lines.get(uriLine).trim();
+-            segment.durationSec = parseDuration(trimmed);
+-            segment.keyMethod = currentKey;
+-            segment.discontinuityBefore = pendingDiscontinuity;
+-            segment.scteAd = inScteAd;
+-            pendingDiscontinuity = 0;
+-            segments.add(segment);
+-            i = uriLine;
+-        }
+-        return segments;
+-    }
+-
+-    /** Industry-standard ad-break markers: CUE-OUT/IN and the SCTE-35 family. */
+-    private static boolean isScteAdStart(String line) {
++            pending.add(t);
++        }
++        tail.addAll(pending);
++
++        for (Node node : nodes) {
++            node.hasDisc = hasDiscontinuity(node.tags);
++        }
++        return new Parsed(head, nodes, tail, implicitIv, encrypted);
++    }
++
++    private static boolean hasDiscontinuity(List<String> tags) {
++        for (String tag : tags) {
++            if (tag.startsWith("#EXT-X-DISCONTINUITY")) return true;
++        }
++        return false;
++    }
++
++    private static boolean isGlobalHead(String t) {
++        return t.startsWith("#EXTM3U")
++                || t.startsWith("#EXT-X-VERSION")
++                || t.startsWith("#EXT-X-TARGETDURATION")
++                || t.startsWith("#EXT-X-MEDIA-SEQUENCE")
++                || t.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE")
++                || t.startsWith("#EXT-X-PLAYLIST-TYPE")
++                || t.startsWith("#EXT-X-I-FRAMES-ONLY")
++                || t.startsWith("#EXT-X-INDEPENDENT-SEGMENTS")
++                || t.startsWith("#EXT-X-START")
++                || t.startsWith("#EXT-X-MAP")
++                || t.startsWith("#EXT-X-ALLOW-CACHE");
++    }
++
++    private static boolean isAes(String method) {
++        return method != null && (method.startsWith("AES-128") || method.startsWith("SAMPLE-AES"));
++    }
++
++    private static boolean hasIv(String keyLine) {
++        return keyLine.matches("(?s).*,IV=.*");
++    }
++
++    private static boolean isScteStart(String line) {
+         if (line.startsWith("#EXT-X-CUE-OUT")
+                 || line.startsWith("#EXT-X-SCTE35")
+                 || line.startsWith("#EXT-OATCLS-SCTE35")) {
+             return true;
+         }
+         return line.startsWith("#EXT-X-DATERANGE")
+-                && line.toUpperCase(java.util.Locale.ROOT).contains("SCTE35");
++                && line.toUpperCase(Locale.ROOT).contains("SCTE35");
+     }
+ 
+     private static String parseKeyMethod(String keyLine) {
+@@ -185,52 +360,126 @@ final class M3u8AdFilter {
+         }
+     }
+ 
+-    private static boolean isEncrypted(List<Segment> segments) {
+-        for (Segment segment : segments) {
+-            if (segment.keyMethod != null && !"NONE".equals(segment.keyMethod)) return true;
++    /* ------------------------------------------------------------------ rebuild */
++
++    private static String rebuild(Parsed parsed) {
++        List<Node> nodes = parsed.nodes;
++        List<String> head = new ArrayList<>(parsed.head);
++
++        int droppedAtStart = 0;
++        int discAtStart = 0;
++        for (Node n : nodes) {
++            if (!n.dropped) break;
++            droppedAtStart++;
++            if (n.hasDisc) discAtStart++;
+         }
+-        return false;
+-    }
+ 
+-    private static String rebuild(List<String> lines, List<Segment> segments, int removedCount) {
+-        boolean[] drop = new boolean[lines.size()];
+-        for (Segment segment : segments) {
+-            if (segment.removed) {
+-                drop[segment.extinfLine] = true;
+-                drop[segment.uriLine] = true;
++        for (int i = 0; i < head.size(); i++) {
++            String line = head.get(i).trim();
++            if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:") && droppedAtStart > 0) {
++                try {
++                    long v =
++                            Long.parseLong(
++                                    line.substring("#EXT-X-MEDIA-SEQUENCE:".length()).trim());
++                    head.set(i, "#EXT-X-MEDIA-SEQUENCE:" + (v + droppedAtStart));
++                } catch (NumberFormatException ignored) {
++                }
++            } else if (line.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE:") && discAtStart > 0) {
++                try {
++                    long v =
++                            Long.parseLong(
++                                    line.substring("#EXT-X-DISCONTINUITY-SEQUENCE:".length())
++                                            .trim());
++                    head.set(i, "#EXT-X-DISCONTINUITY-SEQUENCE:" + (v + discAtStart));
++                } catch (NumberFormatException ignored) {
++                }
+             }
+         }
+ 
+-        int removedAtStart = 0;
+-        for (Segment segment : segments) {
+-            if (segment.removed) {
+-                removedAtStart++;
+-            } else {
+-                break;
++        List<String> out = new ArrayList<>(head);
++        String emittedKey = null;
++        int prevKept = -1;
++        boolean discEmitted = false;
++
++        for (int i = 0; i < nodes.size(); i++) {
++            Node n = nodes.get(i);
++            if (n.dropped) continue;
++
++            if (n.keyRaw != null && !n.keyRaw.equals(emittedKey)) {
++                out.add(n.keyRaw);
++                emittedKey = n.keyRaw;
++            }
++
++            boolean gapDropped = hasDroppedIn(nodes, prevKept + 1, i - 1);
++            boolean wantDisc =
++                    n.hasDisc || (gapDropped && rangeHasDisc(nodes, prevKept + 1, i - 1));
++            if (wantDisc && !discEmitted) out.add("#EXT-X-DISCONTINUITY");
++            discEmitted = wantDisc;
++
++            for (String tag : n.tags) {
++                if (tag.startsWith("#EXT-X-KEY:")) continue;
++                if (tag.startsWith("#EXT-X-DISCONTINUITY")) continue;
++                out.add(tag);
+             }
++            out.add(n.extinf);
++            out.add(n.uri);
++            prevKept = i;
+         }
++        out.addAll(parsed.tail);
++
++        return balanceCues(out);
++    }
+ 
++    private static boolean hasDroppedIn(List<Node> nodes, int from, int to) {
++        for (int i = from; i <= to; i++) {
++            if (i >= 0 && i < nodes.size() && nodes.get(i).dropped) return true;
++        }
++        return false;
++    }
++
++    private static boolean rangeHasDisc(List<Node> nodes, int from, int to) {
++        for (int i = from; i <= to; i++) {
++            if (i >= 0 && i < nodes.size() && nodes.get(i).hasDisc) return true;
++        }
++        return false;
++    }
++
++    /** Drops orphaned CUE-IN / CUE-OUT left behind after the ad block is removed. */
++    private static String balanceCues(List<String> lines) {
+         StringBuilder out = new StringBuilder();
+-        boolean sequenceAdjusted = false;
+-        for (int i = 0; i < lines.size(); i++) {
+-            if (drop[i]) continue;
+-            String line = lines.get(i);
+-            if (removedAtStart > 0 && !sequenceAdjusted) {
+-                String trimmed = line.trim();
+-                if (trimmed.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+-                    try {
+-                        long sequence =
+-                                Long.parseLong(
+-                                        trimmed.substring("#EXT-X-MEDIA-SEQUENCE:".length())
+-                                                .trim());
+-                        line = "#EXT-X-MEDIA-SEQUENCE:" + (sequence + removedAtStart);
+-                    } catch (NumberFormatException ignored) {
+-                    }
+-                    sequenceAdjusted = true;
+-                }
++        boolean open = false;
++        for (String line : lines) {
++            String t = line.trim();
++            boolean cueStart = isCueStart(t);
++            boolean cueIn = t.startsWith("#EXT-X-CUE-IN");
++            if (cueStart) {
++                if (open) out.setLength(out.lastIndexOf("#EXT-X-CUE-OUT"));
++                open = true;
++            } else if (cueIn) {
++                if (!open) continue;
++                open = false;
+             }
+             out.append(line).append('\n');
+         }
+         return out.toString();
+     }
++
++    private static boolean isCueStart(String t) {
++        return t.startsWith("#EXT-X-CUE-OUT")
++                || t.startsWith("#EXT-X-SCTE35")
++                || t.startsWith("#EXT-OATCLS-SCTE35");
++    }
++
++    /* ------------------------------------------------------------------ verify */
++
++    private static String verifyAndFallback(String original, String rebuilt, int expectedSegments) {
++        Parsed parsed = parse(splitLines(rebuilt));
++        int segments = parsed.nodes.size();
++        if (segments != expectedSegments) return null;
++        if (segments < 1) return null;
++        if (!rebuilt.trim().startsWith("#EXTM3U")) return null;
++        // No two consecutive DISCONTINUITY markers.
++        if (rebuilt.contains("#EXT-X-DISCONTINUITY\n#EXT-X-DISCONTINUITY")) return null;
++        return rebuilt;
++    }
+ }
+diff --git a/android/tests/AdFilterChecks.java b/android/tests/AdFilterChecks.java
+index aa5e351..b7e0d35 100644
+--- a/android/tests/AdFilterChecks.java
++++ b/android/tests/AdFilterChecks.java
+@@ -2,7 +2,12 @@ package com.pilipala.marcomovie;
+ 
+ import java.util.Arrays;
+ 
+-/** Offline JVM checks for the pure-Java ad-filter engine. */
++/**
++ * Offline JVM checks for the pure-Java ad-filter engine. Behavior is aligned with the validated
++ * {@code m3u8-adfilter} reference kernel: structural gates (master / live / implicit-IV), strong
++ * evidence (SCTE/CUE, URL rules, private comment markers, KEY-NONE), discontinuity-bounded chunk
++ * scoring, and the structural-corroboration gate that keeps weak shape signals from firing alone.
++ */
+ public final class AdFilterChecks {
+     static int checks;
+ 
+@@ -16,13 +21,16 @@ public final class AdFilterChecks {
+         checkMasterPassthrough();
+         checkRuleRemoval();
+         checkMediaSequenceAdjust();
+-        checkEncryptedStreamSafety();
++        checkImplicitIvSkips();
++        checkExplicitIvAllowsRemoval();
+         checkScteMarkerRemoval();
+         checkNoOverMatchByDefault();
+-        checkDurationWindowHeuristic();
++        checkChunkScoringWithNamingJump();
++        checkShapeOnlyGated();
+         checkKeyNoneSwitchHeuristic();
+         checkMirrorReuseHeuristic();
+         checkUrlPrefixHeuristic();
++        checkCommentMarkerRemoval();
+         checkRulesImporters();
+         checkMerge();
+         System.out.println("AdFilterChecks: " + checks + " checks passed");
+@@ -48,7 +56,8 @@ public final class AdFilterChecks {
+                         + "#EXTINF:5.0,\n"
+                         + "ad_seg2.ts\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "seg1.ts\n";
++                        + "seg1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse(
+                         "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"ad_seg\"}]}");
+@@ -69,7 +78,8 @@ public final class AdFilterChecks {
+                         + "#EXTINF:5.0,\n"
+                         + "ad_1.ts\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "content.ts\n";
++                        + "content.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse(
+                         "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"ad_\"}]}");
+@@ -81,7 +91,9 @@ public final class AdFilterChecks {
+                 "leading removal drops only ad segment");
+     }
+ 
+-    private static void checkEncryptedStreamSafety() {
++    private static void checkImplicitIvSkips() {
++        // AES-128 without IV derives each IV from the sequence number: deleting any segment would
++        // shift every following IV, so the whole playlist must be left untouched.
+         String playlist =
+                 "#EXTM3U\n"
+                         + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
+@@ -90,12 +102,33 @@ public final class AdFilterChecks {
+                         + "#EXTINF:5.0,\n"
+                         + "ad_seg.ts\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "enc1.ts\n";
++                        + "enc1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse(
+                         "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"ad_seg\"}]}");
+         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
+-        check(result.removedSegments == 0, "encrypted stream skips rule-based removal");
++        check(result.removedSegments == 0, "implicit-IV stream is left untouched");
++    }
++
++    private static void checkExplicitIvAllowsRemoval() {
++        // With an explicit IV each segment's IV is fixed, so removing a middle segment is safe.
++        String playlist =
++                "#EXTM3U\n"
++                        + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000000\n"
++                        + "#EXTINF:10.0,\n"
++                        + "enc0.ts\n"
++                        + "#EXTINF:5.0,\n"
++                        + "ad_seg.ts\n"
++                        + "#EXTINF:10.0,\n"
++                        + "enc1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
++        AdFilterRules rules =
++                AdFilterRules.parse(
++                        "{\"playlistRules\":[{\"type\":\"keyword\",\"pattern\":\"ad_seg\"}]}");
++        M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
++        check(result.removedSegments == 1, "explicit-IV stream allows rule-based removal");
++        check(!result.text.contains("ad_seg.ts"), "explicit-IV removal drops the ad segment");
+     }
+ 
+     private static void checkScteMarkerRemoval() {
+@@ -110,7 +143,8 @@ public final class AdFilterChecks {
+                         + "ad2.ts\n"
+                         + "#EXT-X-CUE-IN\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "seg1.ts\n";
++                        + "seg1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", AdFilterRules.empty());
+         check(result.removedSegments == 2, "SCTE/CUE-OUT removes marked ad block");
+         check(
+@@ -131,6 +165,7 @@ public final class AdFilterChecks {
+         for (int i = 50; i < 100; i++) {
+             playlist.append("#EXTINF:10.0,\n").append("s").append(i).append(".ts\n");
+         }
++        playlist.append("#EXT-X-ENDLIST\n");
+         AdFilterRules rules = AdFilterRules.parse("{\"heuristics\":{\"enabled\":true}}");
+         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist.toString(), "host", rules);
+         check(
+@@ -138,32 +173,59 @@ public final class AdFilterChecks {
+                 "default heuristics leave variable-duration content intact");
+     }
+ 
+-    private static void checkDurationWindowHeuristic() {
++    /** A bounded short block whose naming deviates from its neighbours is a naming island (ad). */
++    private static void checkChunkScoringWithNamingJump() {
+         String playlist =
+                 "#EXTM3U\n"
+                         + "#EXTINF:40.0,\n"
+                         + "a.ts\n"
+                         + "#EXTINF:5.0,\n"
+-                        + "ad1.ts\n"
++                        + "x1.ts\n"
+                         + "#EXTINF:5.0,\n"
+-                        + "ad2.ts\n"
++                        + "x2.ts\n"
+                         + "#EXTINF:40.0,\n"
+-                        + "b.ts\n";
++                        + "b.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+-                AdFilterRules.parse(
+-                        "{\"heuristics\":{\"enabled\":true,\"durationWindows\":true,"
+-                                + "\"minAdBlockSegments\":2}}");
++                AdFilterRules.parse("{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2}}");
+         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
+-        check(result.removedSegments == 2, "opt-in duration window removes bounded short block");
++        check(result.removedSegments == 2, "naming-island short block is removed");
+         check(
+-                !result.text.contains("ad1.ts") && !result.text.contains("ad2.ts"),
+-                "opt-in duration window drops ad URI lines");
++                !result.text.contains("x1.ts") && !result.text.contains("x2.ts"),
++                "naming-island drops ad URI lines");
++    }
++
++    /**
++     * A bounded short block with the SAME naming as the surrounding content has no structural
++     * signal, so the weak shape evidence alone must not remove it (the structural gate).
++     */
++    private static void checkShapeOnlyGated() {
++        String playlist =
++                "#EXTM3U\n"
++                        + "#EXTINF:40.0,\n"
++                        + "seg000.ts\n"
++                        + "#EXTINF:5.0,\n"
++                        + "seg001.ts\n"
++                        + "#EXTINF:5.0,\n"
++                        + "seg002.ts\n"
++                        + "#EXTINF:40.0,\n"
++                        + "seg003.ts\n"
++                        + "#EXT-X-ENDLIST\n";
++        AdFilterRules rules =
++                AdFilterRules.parse("{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2}}");
++        M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
++        check(
++                result.removedSegments == 0,
++                "shape-only short block is gated without structural signal");
++        check(
++                result.text.contains("seg001.ts") && result.text.contains("seg002.ts"),
++                "shape-only gate keeps content segments");
+     }
+ 
+     private static void checkKeyNoneSwitchHeuristic() {
+         String playlist =
+                 "#EXTM3U\n"
+-                        + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
++                        + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000000\n"
+                         + "#EXTINF:10.0,\n"
+                         + "enc0.ts\n"
+                         + "#EXT-X-KEY:METHOD=NONE\n"
+@@ -171,9 +233,10 @@ public final class AdFilterChecks {
+                         + "clear1.ts\n"
+                         + "#EXTINF:5.0,\n"
+                         + "clear2.ts\n"
+-                        + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n"
++                        + "#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x00000000000000000000000000000000\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "enc1.ts\n";
++                        + "enc1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse(
+                         "{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2,\"keyNoneSwitch\":true}}");
+@@ -187,6 +250,12 @@ public final class AdFilterChecks {
+     private static void checkMirrorReuseHeuristic() {
+         String playlist =
+                 "#EXTM3U\n"
++                        + "#EXTINF:10.0,\n"
++                        + "c1.ts\n"
++                        + "#EXTINF:10.0,\n"
++                        + "c2.ts\n"
++                        + "#EXTINF:10.0,\n"
++                        + "c3.ts\n"
+                         + "#EXTINF:5.0,\n"
+                         + "loop.ts\n"
+                         + "#EXTINF:5.0,\n"
+@@ -194,17 +263,14 @@ public final class AdFilterChecks {
+                         + "#EXTINF:5.0,\n"
+                         + "loop.ts\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "c1.ts\n"
+-                        + "#EXTINF:10.0,\n"
+-                        + "c2.ts\n"
+-                        + "#EXTINF:10.0,\n"
+-                        + "c3.ts\n";
++                        + "c4.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse("{\"heuristics\":{\"enabled\":true,\"mirrorReuse\":true}}");
+         M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", rules);
+-        check(result.removedSegments == 3, "opt-in mirror reuse removes repeated ad-loop URI");
++        check(result.removedSegments == 3, "mirror reuse removes repeated ad-loop URI");
+         check(
+-                result.text.contains("c1.ts") && result.text.contains("c2.ts"),
++                result.text.contains("c1.ts") && result.text.contains("c4.ts"),
+                 "mirror reuse keeps unique segments");
+     }
+ 
+@@ -218,7 +284,8 @@ public final class AdFilterChecks {
+                         + "#EXTINF:5.0,\n"
+                         + "https://ads.test/ad/2.ts\n"
+                         + "#EXTINF:10.0,\n"
+-                        + "https://cdn.test/a/1.ts\n";
++                        + "https://cdn.test/a/1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
+         AdFilterRules rules =
+                 AdFilterRules.parse(
+                         "{\"heuristics\":{\"enabled\":true,\"minAdBlockSegments\":2,\"urlPrefixAnomaly\":true}}");
+@@ -227,6 +294,30 @@ public final class AdFilterChecks {
+         check(result.text.contains("cdn.test"), "host anomaly keeps dominant host segments");
+     }
+ 
++    /** AD-02: private comment markers such as {@code # ppvod-ad-injected v1}. */
++    private static void checkCommentMarkerRemoval() {
++        String playlist =
++                "#EXTM3U\n"
++                        + "#EXTINF:10.0,\n"
++                        + "seg0.ts\n"
++                        + "# ppvod-ad-injected v1\n"
++                        + "#EXT-X-DISCONTINUITY\n"
++                        + "#EXTINF:4,\n"
++                        + "/20261003/84_9109598f/2000k/hls/1.ts\n"
++                        + "#EXTINF:4,\n"
++                        + "/20261003/84_9109598f/2000k/hls/2.ts\n"
++                        + "#EXT-X-DISCONTINUITY\n"
++                        + "#EXTINF:10.0,\n"
++                        + "seg1.ts\n"
++                        + "#EXT-X-ENDLIST\n";
++        M3u8AdFilter.Result result = M3u8AdFilter.filter(playlist, "host", AdFilterRules.empty());
++        check(result.removedSegments == 2, "private comment marker removes bounded ad block");
++        check(!result.text.contains("84_9109598f"), "comment marker drops ad URI lines");
++        check(
++                result.text.contains("seg0.ts") && result.text.contains("seg1.ts"),
++                "comment marker keeps content segments");
++    }
++
+     private static void checkRulesImporters() {
+         String xc = "[{\"name\":\"site\",\"host\":\"example.com\",\"filter\":\"/ad/\\nsponsor\"}]";
+         String xcConverted = RulesImporter.fromXcJson(xc);
+diff --git a/flutter/assets/adfilter/builtin_rules.json b/flutter/assets/adfilter/builtin_rules.json
+index 45ceeda..482b407 100644
+--- a/flutter/assets/adfilter/builtin_rules.json
++++ b/flutter/assets/adfilter/builtin_rules.json
+@@ -13,6 +13,7 @@
+   "playlistRules": [
+     {"type": "regex", "pattern": "/ad/"},
+     {"type": "regex", "pattern": "/ads/"},
++    {"type": "regex", "pattern": "/adv/"},
+     {"type": "regex", "pattern": "_ad_"},
+     {"type": "regex", "pattern": "_ads_"},
+     {"type": "regex", "pattern": "/adjump"},
+@@ -68,6 +69,8 @@
+     "maxAdBlockDurationSec": 30,
+     "minAdBlockSegments": 2,
+     "maxAdBlockSegments": 8,
++    "maxAdBlockTotalSec": 36,
++    "requireStructural": true,
+     "urlPrefixAnomaly": false,
+     "keyNoneSwitch": true,
+     "mirrorReuse": false,
+diff --git a/flutter/lib/core/ad_filter_rules.dart b/flutter/lib/core/ad_filter_rules.dart
+index e4cfaf5..f59c61f 100644
+--- a/flutter/lib/core/ad_filter_rules.dart
++++ b/flutter/lib/core/ad_filter_rules.dart
+@@ -27,6 +27,10 @@ class Heuristics {
+   int maxAdBlockDurationSec = 30;
+   int minAdBlockSegments = 2;
+   int maxAdBlockSegments = 8;
++  int maxAdBlockTotalSec = 36;
++  bool requireStructural = true;
++  // Deprecated opt-in flags retained for JSON compatibility; the chunk scorer
++  // subsumes them.
+   bool urlPrefixAnomaly = false;
+   bool keyNoneSwitch = true;
+   bool mirrorReuse = false;
+@@ -162,6 +166,8 @@ class AdFilterRules {
+             _optInt(heu, 'maxAdBlockDurationSec', 30);
+         heuristics.minAdBlockSegments = _optInt(heu, 'minAdBlockSegments', 2);
+         heuristics.maxAdBlockSegments = _optInt(heu, 'maxAdBlockSegments', 8);
++        heuristics.maxAdBlockTotalSec = _optInt(heu, 'maxAdBlockTotalSec', 36);
++        heuristics.requireStructural = _optBool(heu, 'requireStructural', true);
+         heuristics.urlPrefixAnomaly = _optBool(heu, 'urlPrefixAnomaly', false);
+         heuristics.keyNoneSwitch = _optBool(heu, 'keyNoneSwitch', true);
+         heuristics.mirrorReuse = _optBool(heu, 'mirrorReuse', false);
+diff --git a/flutter/lib/core/m3u8_ad_filter.dart b/flutter/lib/core/m3u8_ad_filter.dart
+index 10fb4dc..3c5e15c 100644
+--- a/flutter/lib/core/m3u8_ad_filter.dart
++++ b/flutter/lib/core/m3u8_ad_filter.dart
+@@ -1,23 +1,34 @@
++import 'dart:math' as math;
++
+ import 'ad_filter_rules.dart';
+ 
+-/// A parsed media-playlist segment. Mirrors `M3u8AdFilter.Segment`.
++/// A parsed media-playlist segment node. Mirrors `M3u8AdFilter.Node`.
+ class Segment {
++  int index = 0;
++  String extinf = '';
+   String uri = '';
+   double durationSec = 0.0;
+   String? keyMethod; // null = no KEY seen, "NONE", or e.g. "AES-128"
+-  int discontinuityBefore = 0; // #EXT-X-DISCONTINUITY markers since previous segment
+-  bool scteAd = false; // inside a #EXT-X-CUE-OUT/IN or SCTE-35 marked ad break
+-  int extinfLine = 0;
+-  int uriLine = 0;
+-  bool removed = false;
++  String? keyRaw; // raw #EXT-X-KEY line, for structural conservation
++  bool hasDisc = false; // #EXT-X-DISCONTINUITY seen before this node
++  bool scteAd = false; // inside a CUE-OUT/IN or SCTE-35 marked ad break
++  bool adComment = false; // private ad-injection comment seen before this node
++  List<String> tags = <String>[]; // other tag lines (CUE, DATERANGE, comments)
++  bool ruleHit = false; // segment URI matched by rules
++  bool keynone = false; // clear segment inside an otherwise encrypted stream
++  bool namingReuse = false; // naming-key reuse evidence
++  bool mirrorReuse = false; // exact URI reuse evidence
++  String? reason; // human-readable evidence, for diagnostics
++  bool dropped = false;
+ }
+ 
+ /// Filter result. Mirrors `M3u8AdFilter.Result`.
+ class M3u8FilterResult {
+   final String text;
+   final int removedSegments;
++  final String reason;
+ 
+-  M3u8FilterResult(this.text, this.removedSegments);
++  M3u8FilterResult(this.text, this.removedSegments, [this.reason = '']);
+ }
+ 
+ /// Pure HLS media-playlist filter: removes ad segments matched by
+@@ -26,53 +37,125 @@ class M3u8FilterResult {
+ class M3u8AdFilter {
+   M3u8AdFilter._();
+ 
++  /// Private comment markers left by ad-stitching systems, e.g.
++  /// `# ppvod-ad-injected v1`.
++  static final RegExp _adComment = RegExp(
++    r'(ad[-_]?(inject|insert|mark|marker)|ppvod|guanggao|adseg|插播|广告)',
++    caseSensitive: false,
++  );
++
+   static M3u8FilterResult filter(
+       String? m3u8, String? playlistHost, AdFilterRules rules) {
+-    if (m3u8 == null || m3u8.isEmpty) {
+-      return M3u8FilterResult(m3u8 ?? '', 0);
++    if (m3u8 == null || m3u8.trim().isEmpty) {
++      return M3u8FilterResult(m3u8 ?? '', 0, 'empty');
+     }
+     final lines = _splitLines(m3u8);
+     if (lines.isEmpty || !lines[0].trim().startsWith('#EXTM3U')) {
+-      return M3u8FilterResult(m3u8, 0);
++      return M3u8FilterResult(m3u8, 0, 'not-m3u8');
+     }
+-    if (_isMasterPlaylist(lines)) return M3u8FilterResult(m3u8, 0);
+ 
+-    final segments = _parseSegments(lines);
+-    if (segments.isEmpty) return M3u8FilterResult(m3u8, 0);
++    final parsed = _parse(lines);
++    if (parsed.head.isEmpty && parsed.nodes.isEmpty) {
++      return M3u8FilterResult(m3u8, 0, 'no-content');
++    }
+ 
+-    final encrypted = _isEncrypted(segments);
++    // Master playlists are never edited; the variant media playlist is filtered
++    // instead.
++    if (_isMaster(parsed.head)) return M3u8FilterResult(m3u8, 0, 'master');
+ 
+-    // Rule-based and SCTE/CUE removal are only safe for clear streams: deleting
+-    // a segment in the middle of an AES-128 stream shifts the implicit IV of
+-    // every following segment and breaks decryption.
+-    if (!encrypted) {
+-      for (final segment in segments) {
+-        if (segment.scteAd || rules.matchesSegment(playlistHost, segment.uri)) {
+-          segment.removed = true;
+-        }
++    // Live / EVENT playlists have a sliding window; deleting segments breaks
++    // sequence math.
++    if (!_hasEndList(parsed.tail) && !_containsLine(m3u8, '#EXT-X-ENDLIST')) {
++      return M3u8FilterResult(m3u8, 0, 'live-no-endlist');
++    }
++
++    // AES-128 / SAMPLE-AES without an explicit IV derives each IV from the
++    // segment sequence number, so removing any segment shifts every following
++    // IV and breaks decryption.
++    if (parsed.implicitIv) {
++      return M3u8FilterResult(m3u8, 0, 'aes-implicit-iv');
++    }
++
++    if (parsed.nodes.isEmpty) return M3u8FilterResult(m3u8, 0, 'no-segments');
++
++    final heu = rules.heuristics;
++
++    // Reliable per-segment evidence: URL rules and SCTE/CUE markers. These are
++    // unambiguous and always run, independent of the heuristic switch.
++    for (final node in parsed.nodes) {
++      if (rules.matchesSegment(playlistHost, node.uri)) {
++        node.ruleHit = true;
++        node.dropped = true;
++        node.reason = 'rule';
++      }
++      if (node.scteAd) {
++        node.dropped = true;
++        node.reason = _first(node.reason, 'scte');
+       }
+     }
+ 
+-    if (rules.heuristics.enabled) {
+-      final heuristic =
+-          HeuristicAdDetector.detect(segments, rules.heuristics, encrypted);
+-      for (final index in heuristic) {
+-        if (index >= 0 && index < segments.length) {
+-          segments[index].removed = true;
+-        }
++    // Private comment markers (AD-02) mark the whole discontinuity-bounded
++    // block, e.g. "# ppvod-ad-injected v1" immediately before a
++    // DISCONTINUITY-bounded ad pod.
++    for (var i = 0; i < parsed.nodes.length; i++) {
++      final marker = parsed.nodes[i];
++      if (!marker.adComment) continue;
++      var j = i;
++      while (j < parsed.nodes.length) {
++        if (j > i && parsed.nodes[j].hasDisc) break; // closing boundary
++        final block = parsed.nodes[j];
++        block.dropped = true;
++        if (block.reason == null) block.reason = 'ad-comment';
++        j++;
++      }
++    }
++
++    // Heuristic chunk detection (KEY-NONE clear blocks + discontinuity-bounded
++    // shape scoring).
++    if (heu.enabled) {
++      final dropped = HeuristicAdDetector.detect(
++          parsed.nodes, heu, playlistHost, parsed.encrypted);
++      for (final i in dropped) {
++        final n = parsed.nodes[i];
++        n.dropped = true;
++        if (n.reason == null) n.reason = 'heuristic';
+       }
+     }
+ 
+-    var removedCount = 0;
+-    for (final segment in segments) {
+-      if (segment.removed) removedCount++;
++    var removed = 0;
++    for (final n in parsed.nodes) {
++      if (n.dropped) removed++;
+     }
+-    if (removedCount == 0) return M3u8FilterResult(m3u8, 0);
++    if (removed == 0) return M3u8FilterResult(m3u8, 0, 'clean');
++
++    // Safety cap: a single small block is always allowed, but a large deletion
++    // is suspicious.
++    final maxBlock = heu.maxAdBlockSegments;
++    var removedDur = 0.0;
++    for (final n in parsed.nodes) {
++      if (n.dropped) removedDur += n.durationSec;
++    }
++    final ratio =
++        parsed.nodes.isEmpty ? 0.0 : removed / parsed.nodes.length;
++    if (removed > maxBlock && (ratio > 0.15 || removedDur > 120.0)) {
++      return M3u8FilterResult(m3u8, 0, 'revert-over-cap');
++    }
++
++    final rebuilt = _rebuild(parsed);
++    final verified =
++        _verifyAndFallback(m3u8, rebuilt, parsed.nodes.length - removed);
++    if (verified == null) {
++      return M3u8FilterResult(m3u8, 0, 'revert-invariant');
++    }
++    return M3u8FilterResult(verified, removed, 'changed');
++  }
+ 
+-    return M3u8FilterResult(
+-        _rebuild(lines, segments, removedCount), removedCount);
++  static String _first(String? a, String b) {
++    return a == null ? b : '$a+$b';
+   }
+ 
++  /* ------------------------------------------------------------------ parsing */
++
+   static List<String> _splitLines(String text) {
+     final lines = <String>[];
+     var start = 0;
+@@ -93,62 +176,149 @@ class M3u8AdFilter {
+     return lines;
+   }
+ 
+-  static bool _isMasterPlaylist(List<String> lines) {
+-    for (final line in lines) {
++  static bool _isMaster(List<String> head) {
++    for (final line in head) {
+       if (line.trim().startsWith('#EXT-X-STREAM-INF')) return true;
+     }
+     return false;
+   }
+ 
+-  static List<Segment> _parseSegments(List<String> lines) {
+-    final segments = <Segment>[];
+-    String? currentKey;
+-    var pendingDiscontinuity = 0;
+-    var inScteAd = false;
+-    for (var i = 1; i < lines.length; i++) {
+-      final trimmed = lines[i].trim();
+-      if (trimmed.startsWith('#EXT-X-KEY:')) {
+-        currentKey = _parseKeyMethod(trimmed);
++  static bool _hasEndList(List<String> tail) {
++    for (final line in tail) {
++      if (line.trim().startsWith('#EXT-X-ENDLIST')) return true;
++    }
++    return false;
++  }
++
++  static bool _containsLine(String text, String needle) {
++    return text.indexOf(needle) >= 0;
++  }
++
++  static _Parsed _parse(List<String> lines) {
++    final head = <String>[];
++    final nodes = <Segment>[];
++    final tail = <String>[];
++
++    final pending = <String>[];
++    String? currentKeyRaw;
++    String? currentKeyMethod;
++    var implicitIv = false;
++    var encrypted = false;
++    var inScte = false;
++    var pendingAdComment = false;
++    String? pendingExtinf;
++    var seenSegment = false;
++
++    for (final line in lines) {
++      final t = line.trim();
++      if (t.isEmpty) continue;
++
++      if (t.startsWith('#EXTINF:')) {
++        pendingExtinf = t;
++        continue;
++      }
++
++      if (!t.startsWith('#')) {
++        if (pendingExtinf != null) {
++          final node = Segment();
++          node.index = nodes.length;
++          node.extinf = pendingExtinf;
++          node.uri = t;
++          node.durationSec = _parseDuration(pendingExtinf);
++          node.keyRaw = currentKeyRaw;
++          node.keyMethod = currentKeyMethod;
++          node.scteAd = inScte;
++          node.adComment = pendingAdComment;
++          node.tags = List<String>.of(pending);
++          pending.clear();
++          pendingAdComment = false;
++          pendingExtinf = null;
++          seenSegment = true;
++          nodes.add(node);
++        } else {
++          head.addAll(pending);
++          head.add(t);
++          pending.clear();
++        }
++        continue;
++      }
++
++      if (!seenSegment && pendingExtinf == null && _isGlobalHead(t)) {
++        head.add(t);
++        continue;
++      }
++      if (t.startsWith('#EXT-X-KEY:')) {
++        currentKeyRaw = t;
++        currentKeyMethod = _parseKeyMethod(t);
++        if (_isAes(currentKeyMethod) && !_hasIv(t)) implicitIv = true;
++        if (currentKeyMethod != null && currentKeyMethod != 'NONE') {
++          encrypted = true;
++        }
+         continue;
+       }
+-      if (trimmed.startsWith('#EXT-X-DISCONTINUITY')) {
+-        pendingDiscontinuity++;
++      if (t.startsWith('#EXT-X-DISCONTINUITY')) {
++        pending.add(t);
+         continue;
+       }
+-      if (_isScteAdStart(trimmed)) {
+-        inScteAd = true;
++      if (_isScteStart(t)) {
++        inScte = true;
++        pending.add(t);
+         continue;
+       }
+-      if (trimmed.startsWith('#EXT-X-CUE-IN')) {
+-        inScteAd = false;
++      if (t.startsWith('#EXT-X-CUE-IN')) {
++        inScte = false;
++        pending.add(t);
+         continue;
+       }
+-      if (!trimmed.startsWith('#EXTINF:')) continue;
+-      var uriLine = -1;
+-      for (var j = i + 1; j < lines.length; j++) {
+-        final next = lines[j].trim();
+-        if (next.isEmpty || next.startsWith('#')) continue;
+-        uriLine = j;
+-        break;
++      // Private comment markers (AD-02): "# ppvod-ad-injected v1" etc.
++      if (t.codeUnitAt(0) == 0x23 &&
++          !t.startsWith('#EXT') &&
++          _adComment.hasMatch(t)) {
++        pendingAdComment = true;
++        pending.add(t);
++        continue;
+       }
+-      if (uriLine == -1) continue;
+-      final segment = Segment();
+-      segment.extinfLine = i;
+-      segment.uriLine = uriLine;
+-      segment.uri = lines[uriLine].trim();
+-      segment.durationSec = _parseDuration(trimmed);
+-      segment.keyMethod = currentKey;
+-      segment.discontinuityBefore = pendingDiscontinuity;
+-      segment.scteAd = inScteAd;
+-      pendingDiscontinuity = 0;
+-      segments.add(segment);
+-      i = uriLine;
+-    }
+-    return segments;
+-  }
+-
+-  /// Industry-standard ad-break markers: CUE-OUT/IN and the SCTE-35 family.
+-  static bool _isScteAdStart(String line) {
++      pending.add(t);
++    }
++    tail.addAll(pending);
++
++    for (final node in nodes) {
++      node.hasDisc = _hasDiscontinuity(node.tags);
++    }
++    return _Parsed(head, nodes, tail, implicitIv, encrypted);
++  }
++
++  static bool _hasDiscontinuity(List<String> tags) {
++    for (final tag in tags) {
++      if (tag.startsWith('#EXT-X-DISCONTINUITY')) return true;
++    }
++    return false;
++  }
++
++  static bool _isGlobalHead(String t) {
++    return t.startsWith('#EXTM3U') ||
++        t.startsWith('#EXT-X-VERSION') ||
++        t.startsWith('#EXT-X-TARGETDURATION') ||
++        t.startsWith('#EXT-X-MEDIA-SEQUENCE') ||
++        t.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE') ||
++        t.startsWith('#EXT-X-PLAYLIST-TYPE') ||
++        t.startsWith('#EXT-X-I-FRAMES-ONLY') ||
++        t.startsWith('#EXT-X-INDEPENDENT-SEGMENTS') ||
++        t.startsWith('#EXT-X-START') ||
++        t.startsWith('#EXT-X-MAP') ||
++        t.startsWith('#EXT-X-ALLOW-CACHE');
++  }
++
++  static bool _isAes(String? method) {
++    return method != null &&
++        (method.startsWith('AES-128') || method.startsWith('SAMPLE-AES'));
++  }
++
++  static bool _hasIv(String keyLine) {
++    return keyLine.contains(',IV=');
++  }
++
++  static bool _isScteStart(String line) {
+     if (line.startsWith('#EXT-X-CUE-OUT') ||
+         line.startsWith('#EXT-X-SCTE35') ||
+         line.startsWith('#EXT-OATCLS-SCTE35')) {
+@@ -164,7 +334,6 @@ class M3u8AdFilter {
+     if (index == -1) return null;
+     final start = index + method.length;
+     var end = start;
+-    // Stop at the comma or space that terminates the METHOD value.
+     while (end < keyLine.length &&
+         keyLine.codeUnitAt(end) != 0x2C &&
+         keyLine.codeUnitAt(end) != 0x20) {
+@@ -182,54 +351,145 @@ class M3u8AdFilter {
+     return double.tryParse(number) ?? 0.0;
+   }
+ 
+-  static bool _isEncrypted(List<Segment> segments) {
+-    for (final segment in segments) {
+-      if (segment.keyMethod != null && segment.keyMethod != 'NONE') return true;
++  /* ------------------------------------------------------------------ rebuild */
++
++  static String _rebuild(_Parsed parsed) {
++    final nodes = parsed.nodes;
++    final head = <String>[...parsed.head];
++
++    var droppedAtStart = 0;
++    var discAtStart = 0;
++    for (final n in nodes) {
++      if (!n.dropped) break;
++      droppedAtStart++;
++      if (n.hasDisc) discAtStart++;
+     }
+-    return false;
+-  }
+ 
+-  static String _rebuild(
+-      List<String> lines, List<Segment> segments, int removedCount) {
+-    final drop = List<bool>.filled(lines.length, false);
+-    for (final segment in segments) {
+-      if (segment.removed) {
+-        drop[segment.extinfLine] = true;
+-        drop[segment.uriLine] = true;
++    for (var i = 0; i < head.length; i++) {
++      final line = head[i].trim();
++      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:') && droppedAtStart > 0) {
++        final numberText =
++            line.substring('#EXT-X-MEDIA-SEQUENCE:'.length).trim();
++        final v = int.tryParse(numberText);
++        if (v != null) head[i] = '#EXT-X-MEDIA-SEQUENCE:${v + droppedAtStart}';
++      } else if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:') &&
++          discAtStart > 0) {
++        final numberText =
++            line.substring('#EXT-X-DISCONTINUITY-SEQUENCE:'.length).trim();
++        final v = int.tryParse(numberText);
++        if (v != null) {
++          head[i] = '#EXT-X-DISCONTINUITY-SEQUENCE:${v + discAtStart}';
++        }
+       }
+     }
+ 
+-    var removedAtStart = 0;
+-    for (final segment in segments) {
+-      if (segment.removed) {
+-        removedAtStart++;
+-      } else {
+-        break;
++    final out = <String>[...head];
++    String? emittedKey;
++    var prevKept = -1;
++    var discEmitted = false;
++
++    for (var i = 0; i < nodes.length; i++) {
++      final n = nodes[i];
++      if (n.dropped) continue;
++
++      if (n.keyRaw != null && n.keyRaw != emittedKey) {
++        out.add(n.keyRaw!);
++        emittedKey = n.keyRaw;
++      }
++
++      final gapDropped = _hasDroppedIn(nodes, prevKept + 1, i - 1);
++      final wantDisc = n.hasDisc ||
++          (gapDropped && _rangeHasDisc(nodes, prevKept + 1, i - 1));
++      if (wantDisc && !discEmitted) out.add('#EXT-X-DISCONTINUITY');
++      discEmitted = wantDisc;
++
++      for (final tag in n.tags) {
++        if (tag.startsWith('#EXT-X-KEY:')) continue;
++        if (tag.startsWith('#EXT-X-DISCONTINUITY')) continue;
++        out.add(tag);
+       }
++      out.add(n.extinf);
++      out.add(n.uri);
++      prevKept = i;
++    }
++    out.addAll(parsed.tail);
++
++    return _balanceCues(out);
++  }
++
++  static bool _hasDroppedIn(List<Segment> nodes, int from, int to) {
++    for (var i = from; i <= to; i++) {
++      if (i >= 0 && i < nodes.length && nodes[i].dropped) return true;
+     }
++    return false;
++  }
++
++  static bool _rangeHasDisc(List<Segment> nodes, int from, int to) {
++    for (var i = from; i <= to; i++) {
++      if (i >= 0 && i < nodes.length && nodes[i].hasDisc) return true;
++    }
++    return false;
++  }
+ 
++  /// Drops orphaned CUE-IN / CUE-OUT left behind after the ad block is removed.
++  static String _balanceCues(List<String> lines) {
+     final out = StringBuffer();
+-    var sequenceAdjusted = false;
+-    for (var i = 0; i < lines.length; i++) {
+-      if (drop[i]) continue;
+-      var line = lines[i];
+-      if (removedAtStart > 0 && !sequenceAdjusted) {
+-        final trimmed = line.trim();
+-        if (trimmed.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+-          final numberText =
+-              trimmed.substring('#EXT-X-MEDIA-SEQUENCE:'.length).trim();
+-          final sequence = int.tryParse(numberText);
+-          if (sequence != null) {
+-            line = '#EXT-X-MEDIA-SEQUENCE:${sequence + removedAtStart}';
++    var open = false;
++    for (final line in lines) {
++      final t = line.trim();
++      final cueStart = _isCueStart(t);
++      final cueIn = t.startsWith('#EXT-X-CUE-IN');
++      if (cueStart) {
++        if (open) {
++          final text = out.toString();
++          final idx = text.lastIndexOf('#EXT-X-CUE-OUT');
++          if (idx >= 0) {
++            out.clear();
++            out.write(text.substring(0, idx));
+           }
+-          sequenceAdjusted = true;
+         }
++        open = true;
++      } else if (cueIn) {
++        if (!open) continue;
++        open = false;
+       }
+       out.write(line);
+       out.write('\n');
+     }
+     return out.toString();
+   }
++
++  static bool _isCueStart(String t) {
++    return t.startsWith('#EXT-X-CUE-OUT') ||
++        t.startsWith('#EXT-X-SCTE35') ||
++        t.startsWith('#EXT-OATCLS-SCTE35');
++  }
++
++  /* ------------------------------------------------------------------ verify */
++
++  static String? _verifyAndFallback(
++      String original, String rebuilt, int expectedSegments) {
++    final parsed = _parse(_splitLines(rebuilt));
++    final segments = parsed.nodes.length;
++    if (segments != expectedSegments) return null;
++    if (segments < 1) return null;
++    if (!rebuilt.trim().startsWith('#EXTM3U')) return null;
++    // No two consecutive DISCONTINUITY markers.
++    if (rebuilt.contains('#EXT-X-DISCONTINUITY\n#EXT-X-DISCONTINUITY')) {
++      return null;
++    }
++    return rebuilt;
++  }
++}
++
++class _Parsed {
++  final List<String> head;
++  final List<Segment> nodes;
++  final List<String> tail;
++  final bool implicitIv;
++  final bool encrypted;
++
++  _Parsed(this.head, this.nodes, this.tail, this.implicitIv, this.encrypted);
+ }
+ 
+ /// Heuristic ad-segment detection for media playlists whose ad inserts cannot
+@@ -237,199 +497,352 @@ class M3u8AdFilter {
+ class HeuristicAdDetector {
+   HeuristicAdDetector._();
+ 
+-  static Set<int> detect(
+-      List<Segment> segments, Heuristics cfg, bool encrypted) {
+-    final remove = <int>{};
+-    if (!cfg.enabled || segments.isEmpty) return remove;
+-
+-    // Removing segments inside an encrypted stream shifts implicit IVs, so only
+-    // the clear-block detector is safe there. The remaining detectors run on
+-    // clear streams only.
+-    if (encrypted) {
+-      if (cfg.keyNoneSwitch) {
+-        remove.addAll(_detectKeyNoneSwitch(segments, cfg));
+-      }
+-      return remove;
++  static const double W_UNIFORM_SHORT = 0.40;
++  static const double W_SHORT_ONLY = 0.20;
++  static const double W_DISC = 0.15;
++  static const double W_OFF_HOST = 0.15;
++  static const double W_URL_DEV = 0.10;
++  static const double W_SHORT_BETWEEN_LONG = 0.20;
++  static const double W_NAMING_REUSE = 0.25;
++  static const double W_DENSE_SHORT = 0.10;
++  static const double W_SEQ_ISLAND = 0.08;
++  static const double W_SINGLE = -0.30;
++  static const double W_LONG = -0.20;
++  static const double W_TOTAL = -0.30;
++
++  static const double BASE_THRESHOLD = 0.60;
++  static const double FIRST_BONUS = 0.20;
++  static const double LAST_BONUS = 0.10;
++  static const double UNIFORM_TOLERANCE = 0.8;
++
++  /// Structural (non-duration) signals required to corroborate a weak
++  /// shape-only hit.
++  static const List<String> STRUCTURAL_NOTES = <String>[
++    'disc',
++    'offhost',
++    'url-dev',
++    'naming-reuse',
++    'mirror-reuse',
++    'seq-island',
++  ];
++
++  static Set<int> detect(List<Segment> nodes, Heuristics cfg,
++      String? playlistHost, bool encrypted) {
++    final drop = <int>{};
++    if (nodes.isEmpty) return drop;
++
++    final minSegments = cfg.minAdBlockSegments;
++    final maxSegments = cfg.maxAdBlockSegments;
++    final minDur = cfg.minAdBlockDurationSec;
++    final maxTotal = cfg.maxAdBlockTotalSec;
++    final requireStructural = cfg.requireStructural;
++    final keyNone = cfg.keyNoneSwitch;
++
++    // KEY-NONE: a clear block inside an otherwise encrypted stream is strong
++    // evidence.
++    if (encrypted && keyNone) {
++      _detectKeyNone(nodes, minSegments, maxSegments, drop);
+     }
+-    if (cfg.urlPrefixAnomaly) {
+-      remove.addAll(_detectHostAnomaly(segments, cfg));
+-    }
+-    if (cfg.mirrorReuse) {
+-      remove.addAll(_detectMirrorReuse(segments, cfg));
++
++    // Naming / mirror reuse evidence (clear streams only, to avoid key-URI
++    // reuse confusion).
++    if (!encrypted) {
++      _detectReuse(nodes, cfg.maxAdBlockDurationSec);
+     }
+-    if (cfg.durationWindows) {
+-      remove.addAll(_detectDurationWindows(segments, cfg));
++
++    // Discontinuity-bounded chunk scoring.
++    final chunks = _buildChunks(nodes);
++    final ctx = _buildContext(nodes, chunks);
++    for (var i = 0; i < chunks.length; i++) {
++      final chunk = chunks[i];
++      final hit = _scoreChunk(chunk, i, chunks, ctx, minSegments, maxSegments,
++          minDur, maxTotal, requireStructural);
++      if (hit) {
++        for (final n in chunk) {
++          drop.add(n.index);
++        }
++      }
+     }
+-    return remove;
++    return drop;
+   }
+ 
+-  static bool _isClear(Segment segment) {
+-    return segment.keyMethod == null || segment.keyMethod == 'NONE';
++  /* ---------------------------------------------------------------- context */
++
++  static _Context _buildContext(
++      List<Segment> nodes, List<List<Segment>> chunks) {
++    final ctx = _Context();
++    final hosts = <String>[];
++    for (final n in nodes) {
++      final h = _hostOf(n.uri);
++      if (h != null) hosts.add(h);
++    }
++    ctx.dominantHost = hosts.length >= nodes.length * 0.5 ? _mode(hosts) : null;
++
++    final keys = <String>[];
++    for (final n in nodes) {
++      final k = _namingKey(n.uri);
++      if (k.isNotEmpty) keys.add(k);
++    }
++    ctx.dominantKey = _mode(keys);
++
++    final durs = <double>[];
++    for (final n in nodes) {
++      if (n.durationSec > 0) durs.add(n.durationSec);
++    }
++    ctx.medianDur = _median(durs);
++    ctx.avgChunkSize = chunks.isEmpty ? nodes.length.toDouble() : nodes.length / chunks.length;
++    return ctx;
+   }
+ 
+-  /// Removes contiguous clear blocks that sit inside an otherwise encrypted
+-  /// stream.
+-  static Set<int> _detectKeyNoneSwitch(
+-      List<Segment> segments, Heuristics cfg) {
+-    final remove = <int>{};
+-    var start = 0;
+-    while (start < segments.length) {
+-      if (!_isClear(segments[start])) {
+-        start++;
+-        continue;
+-      }
+-      var end = start;
+-      while (end < segments.length && _isClear(segments[end])) {
+-        end++;
+-      }
+-      final length = end - start;
+-      final boundedLeft = start > 0 && !_isClear(segments[start - 1]);
+-      final boundedRight = end < segments.length && !_isClear(segments[end]);
+-      if (length >= cfg.minAdBlockSegments &&
+-          length <= cfg.maxAdBlockSegments &&
+-          (boundedLeft || boundedRight)) {
+-        for (var i = start; i < end; i++) {
+-          remove.add(i);
++  /* ---------------------------------------------------------------- chunks */
++
++  static List<List<Segment>> _buildChunks(List<Segment> nodes) {
++    final chunks = <List<Segment>>[];
++    var cur = <Segment>[];
++    Segment? prev;
++    for (final n in nodes) {
++      var boundary = false;
++      if (cur.isNotEmpty && prev != null) {
++        if (n.hasDisc) {
++          boundary = true;
++        } else if (n.keyRaw != prev.keyRaw) {
++          boundary = true;
++        } else if (n.scteAd != prev.scteAd) {
++          boundary = true;
++        } else {
++          final jump = (n.durationSec - prev.durationSec).abs();
++          final scale = math
++              .max(3.0, 0.35 * math.max(n.durationSec, prev.durationSec))
++              .toDouble();
++          if (jump >= scale) boundary = true;
+         }
+       }
+-      start = end;
++      if (boundary) {
++        chunks.add(cur);
++        cur = <Segment>[];
++      }
++      cur.add(n);
++      prev = n;
+     }
+-    return remove;
++    if (cur.isNotEmpty) chunks.add(cur);
++    return chunks;
+   }
+ 
+-  /// Removes short contiguous runs served from a different host than the
+-  /// playlist's dominant host, only when the run is bounded on both sides by the
+-  /// dominant host (classic ad-CD insert).
+-  static Set<int> _detectHostAnomaly(
+-      List<Segment> segments, Heuristics cfg) {
+-    final remove = <int>{};
+-    final dominant = _dominantHost(segments);
+-    if (dominant == null || dominant.isEmpty) return remove;
+-    var start = 0;
+-    while (start < segments.length) {
+-      if (_hostOf(segments[start].uri) == dominant) {
+-        start++;
+-        continue;
++  static bool _scoreChunk(
++      List<Segment> chunk,
++      int idx,
++      List<List<Segment>> chunks,
++      _Context ctx,
++      int minSegments,
++      int maxSegments,
++      int minDur,
++      int maxTotal,
++      bool requireStructural) {
++    final n = chunk.length;
++    var total = 0.0;
++    var min = double.infinity;
++    var max = 0.0;
++    for (final node in chunk) {
++      total += node.durationSec;
++      if (node.durationSec < min) min = node.durationSec;
++      if (node.durationSec > max) max = node.durationSec;
++    }
++    final uniform = n >= 2 && (max - min) <= UNIFORM_TOLERANCE;
++    final shortShape = min >= minDur && total <= maxTotal;
++
++    var namingReuseCount = 0;
++    var mirrorReuseCount = 0;
++    var offHost = false;
++    var urlDev = false;
++    for (final node in chunk) {
++      if (node.namingReuse) namingReuseCount++;
++      if (node.mirrorReuse) mirrorReuseCount++;
++      if (ctx.dominantHost != null) {
++        final h = _hostOf(node.uri);
++        if (h != null && h != ctx.dominantHost) offHost = true;
+       }
+-      var end = start;
+-      while (end < segments.length && _hostOf(segments[end].uri) != dominant) {
+-        end++;
++      if (ctx.dominantKey != null && ctx.dominantKey!.isNotEmpty) {
++        if (_namingKey(node.uri) != ctx.dominantKey) urlDev = true;
+       }
+-      final length = end - start;
+-      final boundedLeft =
+-          start > 0 && _hostOf(segments[start - 1].uri) == dominant;
+-      final boundedRight =
+-          end < segments.length && _hostOf(segments[end].uri) == dominant;
+-      if (length >= cfg.minAdBlockSegments &&
+-          length <= cfg.maxAdBlockSegments &&
+-          boundedLeft &&
+-          boundedRight) {
+-        for (var i = start; i < end; i++) {
+-          remove.add(i);
++    }
++
++    final notes = <String>[];
++    var score = 0.0;
++    if (shortShape && uniform) {
++      score += W_UNIFORM_SHORT;
++      notes.add('uniform-short');
++    } else if (shortShape) {
++      score += W_SHORT_ONLY;
++      notes.add('short');
++    }
++    if (n < minSegments) {
++      score += W_SINGLE;
++      notes.add('single');
++    }
++    if (n > maxSegments) {
++      score += W_LONG;
++      notes.add('long$n');
++    }
++    if (total > 90) {
++      score += W_TOTAL;
++      notes.add('total>90s');
++    }
++    if (chunk.isNotEmpty && chunk.first.hasDisc) {
++      score += W_DISC;
++      notes.add('disc');
++    }
++    if (offHost) {
++      score += W_OFF_HOST;
++      notes.add('offhost');
++    }
++    if (urlDev) {
++      score += W_URL_DEV;
++      notes.add('url-dev');
++    }
++    if (namingReuseCount * 2 >= n) {
++      score += W_NAMING_REUSE;
++      notes.add('naming-reuse');
++    }
++    if (mirrorReuseCount * 2 >= n) {
++      score += W_NAMING_REUSE;
++      notes.add('mirror-reuse');
++    }
++    if (idx > 0 && idx < chunks.length - 1) {
++      final prevChunk = chunks[idx - 1];
++      final nextChunk = chunks[idx + 1];
++      if (prevChunk.isNotEmpty && nextChunk.isNotEmpty) {
++        final prevDur = prevChunk.last.durationSec;
++        final nextDur = nextChunk.first.durationSec;
++        if (prevDur >= 1.5 * max && nextDur >= 1.5 * max) {
++          score += W_SHORT_BETWEEN_LONG;
++          notes.add('short-between-long');
++        }
++        final curKey = _modeKey(chunk);
++        final pk = _modeKey(prevChunk);
++        final nk = _modeKey(nextChunk);
++        if (curKey.isNotEmpty &&
++            pk.isNotEmpty &&
++            nk.isNotEmpty &&
++            curKey != pk &&
++            curKey != nk) {
++          score += W_SEQ_ISLAND;
++          notes.add('seq-island');
+         }
+       }
+-      start = end;
+     }
+-    return remove;
++    if (ctx.medianDur > 0 &&
++        ctx.medianDur <= 5 &&
++        uniform &&
++        n >= 2 * math.max(1, ctx.avgChunkSize.round())) {
++      score += W_DENSE_SHORT;
++      notes.add('dense-short');
++    }
++
++    final threshold = BASE_THRESHOLD +
++        (idx == 0 ? FIRST_BONUS : 0.0) +
++        (idx == chunks.length - 1 ? LAST_BONUS : 0.0);
++    var hit = score >= threshold;
++    if (hit && requireStructural && !_hasStructural(notes)) {
++      hit = false;
++    }
++    return hit;
+   }
+ 
+-  /// Removes every occurrence of a URI that repeats heavily (ad-loop evidence)
+-  /// while the rest of the playlist is mostly unique. Requires at least three
+-  /// repeats, at least four distinct URIs, and short segment durations.
+-  static Set<int> _detectMirrorReuse(
+-      List<Segment> segments, Heuristics cfg) {
+-    final remove = <int>{};
+-    final counts = <String, int>{};
+-    for (final segment in segments) {
+-      if (segment.uri.isEmpty) continue;
+-      counts[segment.uri] = (counts[segment.uri] ?? 0) + 1;
+-    }
+-    if (counts.length < 4) return remove;
+-    for (var i = 0; i < segments.length; i++) {
+-      final segment = segments[i];
+-      if (segment.uri.isEmpty) continue;
+-      final seen = counts[segment.uri] ?? 0;
+-      if (seen >= 3 &&
+-          segment.durationSec > 0.0 &&
+-          segment.durationSec <= cfg.maxAdBlockDurationSec) {
+-        remove.add(i);
+-      }
++  static bool _hasStructural(List<String> notes) {
++    for (final note in notes) {
++      if (STRUCTURAL_NOTES.contains(note)) return true;
++    }
++    return false;
++  }
++
++  static String _modeKey(List<Segment> chunk) {
++    final keys = <String>[];
++    for (final node in chunk) {
++      final k = _namingKey(node.uri);
++      if (k.isNotEmpty) keys.add(k);
+     }
+-    return remove;
++    return _mode(keys);
+   }
+ 
+-  /// Removes a short, uniformly-timed block of segments that is bounded on both
+-  /// sides by clearly longer content, with no discontinuity inside. Disabled by
+-  /// default: segment duration alone is an unreliable ad signal in HLS.
+-  static Set<int> _detectDurationWindows(
+-      List<Segment> segments, Heuristics cfg) {
+-    final remove = <int>{};
++  /* ---------------------------------------------------------------- keynone */
++
++  static void _detectKeyNone(
++      List<Segment> nodes, int minSegments, int maxSegments, Set<int> drop) {
+     var start = 0;
+-    while (start < segments.length) {
+-      if (!_isAdLikeDuration(segments[start], cfg)) {
++    while (start < nodes.length) {
++      if (!_isClear(nodes[start])) {
+         start++;
+         continue;
+       }
+       var end = start;
+-      while (end < segments.length && _isAdLikeDuration(segments[end], cfg)) {
++      while (end < nodes.length && _isClear(nodes[end])) {
+         end++;
+       }
+       final length = end - start;
+-      final boundedLeft = start > 0 && _isLongContent(segments[start - 1], cfg);
+-      final boundedRight =
+-          end < segments.length && _isLongContent(segments[end], cfg);
+-      var noDiscontinuity = true;
+-      for (var i = start; i < end; i++) {
+-        if (segments[i].discontinuityBefore > 0) {
+-          noDiscontinuity = false;
+-          break;
+-        }
+-      }
+-      if (length >= cfg.minAdBlockSegments &&
+-          length <= cfg.maxAdBlockSegments &&
+-          boundedLeft &&
+-          boundedRight &&
+-          noDiscontinuity) {
++      final left = start > 0 && !_isClear(nodes[start - 1]);
++      final right = end < nodes.length && !_isClear(nodes[end]);
++      if (length >= minSegments && length <= maxSegments && (left || right)) {
+         for (var i = start; i < end; i++) {
+-          remove.add(i);
++          drop.add(nodes[i].index);
+         }
+       }
+       start = end;
+     }
+-    return remove;
+   }
+ 
+-  static bool _isAdLikeDuration(Segment segment, Heuristics cfg) {
+-    final duration = segment.durationSec;
+-    return duration >= cfg.minAdBlockDurationSec &&
+-        duration <= cfg.maxAdBlockDurationSec;
++  static bool _isClear(Segment n) {
++    return n.keyMethod == null || n.keyMethod == 'NONE';
+   }
+ 
+-  static bool _isLongContent(Segment segment, Heuristics cfg) {
+-    return segment.durationSec > cfg.maxAdBlockDurationSec;
+-  }
++  /* ---------------------------------------------------------------- reuse */
+ 
+-  static String? _dominantHost(List<Segment> segments) {
+-    final hosts = <String, int>{};
+-    for (final segment in segments) {
+-      final host = _hostOf(segment.uri);
+-      if (host == null || host.isEmpty) continue;
+-      hosts[host] = (hosts[host] ?? 0) + 1;
++  static void _detectReuse(List<Segment> nodes, int maxDur) {
++    final uriCount = <String, int>{};
++    final keyCount = <String, int>{};
++    for (final n in nodes) {
++      uriCount[n.uri] = (uriCount[n.uri] ?? 0) + 1;
++      final k = _namingKey(n.uri);
++      if (k.isNotEmpty) keyCount[k] = (keyCount[k] ?? 0) + 1;
+     }
+-    String? best;
+-    var bestCount = 0;
+-    for (final entry in hosts.entries) {
+-      if (entry.value > bestCount) {
+-        best = entry.key;
+-        bestCount = entry.value;
++    for (final n in nodes) {
++      if (uriCount.length >= 4 &&
++          (uriCount[n.uri] ?? 0) >= 3 &&
++          n.durationSec <= maxDur) {
++        n.mirrorReuse = true;
++      }
++      final k = _namingKey(n.uri);
++      if (k.isNotEmpty &&
++          keyCount.length >= 3 &&
++          (keyCount[k] ?? 0) >= 3 &&
++          n.durationSec <= maxDur) {
++        n.namingReuse = true;
+       }
+     }
+-    return best;
++  }
++
++  /* ---------------------------------------------------------------- helpers */
++
++  static String _namingKey(String uri) {
++    var p = uri;
++    final scheme = p.indexOf('://');
++    if (scheme >= 0) {
++      final hostStart = scheme + 3;
++      final slash = p.indexOf('/', hostStart);
++      if (slash >= 0) p = p.substring(slash);
++    }
++    var cut = p.length;
++    final q = p.indexOf('?');
++    final h = p.indexOf('#');
++    if (q >= 0 && q < cut) cut = q;
++    if (h >= 0 && h < cut) cut = h;
++    p = p.substring(0, cut);
++    return p.replaceAll(RegExp(r'\d+'), '#').toLowerCase();
+   }
+ 
+   static String? _hostOf(String uri) {
+     final scheme = uri.indexOf('://');
+-    final start = scheme >= 0 ? scheme + 3 : 0;
++    if (scheme < 0) return null; // relative URI carries no host
++    final start = scheme + 3;
+     var end = start;
+     while (end < uri.length) {
+       final c = uri.codeUnitAt(end);
+@@ -439,4 +852,35 @@ class HeuristicAdDetector {
+     final host = uri.substring(start, end).trim();
+     return host.isEmpty ? null : host.toLowerCase();
+   }
++
++  static String _mode(List<String> values) {
++    final counts = <String, int>{};
++    for (final v in values) {
++      if (v.isEmpty) continue;
++      counts[v] = (counts[v] ?? 0) + 1;
++    }
++    var best = '';
++    var bestCount = 0;
++    counts.forEach((key, value) {
++      if (value > bestCount) {
++        best = key;
++        bestCount = value;
++      }
++    });
++    return best;
++  }
++
++  static double _median(List<double> values) {
++    if (values.isEmpty) return 0;
++    final a = <double>[...values]..sort();
++    final m = a.length >> 1;
++    return a.length.isOdd ? a[m] : (a[m - 1] + a[m]) / 2.0;
++  }
++}
++
++class _Context {
++  String? dominantHost;
++  String dominantKey = '';
++  double medianDur = 0;
++  double avgChunkSize = 0;
+ }
+diff --git a/flutter/test/ad_filter_test.dart b/flutter/test/ad_filter_test.dart
+index 5b7a186..7e06f40 100644
+--- a/flutter/test/ad_filter_test.dart
++++ b/flutter/test/ad_filter_test.dart
+@@ -24,7 +24,8 @@ void main() {
+         '#EXTINF:5.0,\n'
+         'ad_seg2.ts\n'
+         '#EXTINF:10.0,\n'
+-        'seg1.ts\n';
++        'seg1.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+@@ -41,7 +42,8 @@ void main() {
+         '#EXTINF:5.0,\n'
+         'ad_1.ts\n'
+         '#EXTINF:10.0,\n'
+-        'content.ts\n';
++        'content.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"playlistRules":[{"type":"keyword","pattern":"ad_"}]}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+@@ -51,7 +53,10 @@ void main() {
+     expect(result.text.contains('content.ts'), isTrue);
+   });
+ 
+-  test('encrypted stream skips rule-based removal', () {
++  test('implicit-IV stream is left untouched', () {
++    // AES-128 without an explicit IV derives each IV from the sequence number:
++    // deleting any segment shifts every following IV, so the whole playlist is
++    // left untouched.
+     final playlist = '#EXTM3U\n'
+         '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+         '#EXTINF:10.0,\n'
+@@ -59,13 +64,31 @@ void main() {
+         '#EXTINF:5.0,\n'
+         'ad_seg.ts\n'
+         '#EXTINF:10.0,\n'
+-        'enc1.ts\n';
++        'enc1.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+     expect(result.removedSegments, 0);
+   });
+ 
++  test('explicit IV allows rule-based removal', () {
++    final playlist = '#EXTM3U\n'
++        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
++        '#EXTINF:10.0,\n'
++        'enc0.ts\n'
++        '#EXTINF:5.0,\n'
++        'ad_seg.ts\n'
++        '#EXTINF:10.0,\n'
++        'enc1.ts\n'
++        '#EXT-X-ENDLIST\n';
++    final rules = AdFilterRules.parse(
++        '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
++    final result = M3u8AdFilter.filter(playlist, 'host', rules);
++    expect(result.removedSegments, 1);
++    expect(result.text.contains('ad_seg.ts'), isFalse);
++  });
++
+   test('SCTE/CUE-OUT removes marked ad block', () {
+     final playlist = '#EXTM3U\n'
+         '#EXTINF:10.0,\n'
+@@ -77,7 +100,8 @@ void main() {
+         'ad2.ts\n'
+         '#EXT-X-CUE-IN\n'
+         '#EXTINF:10.0,\n'
+-        'seg1.ts\n';
++        'seg1.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final result = M3u8AdFilter.filter(playlist, 'host', AdFilterRules.empty());
+     expect(result.removedSegments, 2);
+     expect(result.text.contains('ad1.ts'), isFalse);
+@@ -98,33 +122,53 @@ void main() {
+       buffer.write('#EXTINF:10.0,\n');
+       buffer.write('s$i.ts\n');
+     }
++    buffer.write('#EXT-X-ENDLIST\n');
+     final rules = AdFilterRules.parse('{"heuristics":{"enabled":true}}');
+     final result = M3u8AdFilter.filter(buffer.toString(), 'host', rules);
+     expect(result.removedSegments, 0);
+   });
+ 
+-  test('opt-in duration window removes bounded short block', () {
++  test('chunk scoring removes naming-island short block', () {
+     final playlist = '#EXTM3U\n'
+         '#EXTINF:40.0,\n'
+         'a.ts\n'
+         '#EXTINF:5.0,\n'
+-        'ad1.ts\n'
++        'x1.ts\n'
+         '#EXTINF:5.0,\n'
+-        'ad2.ts\n'
++        'x2.ts\n'
+         '#EXTINF:40.0,\n'
+-        'b.ts\n';
++        'b.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+-        '{"heuristics":{"enabled":true,"durationWindows":true,'
+-        '"minAdBlockSegments":2}}');
++        '{"heuristics":{"enabled":true,"minAdBlockSegments":2}}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+     expect(result.removedSegments, 2);
+-    expect(result.text.contains('ad1.ts'), isFalse);
+-    expect(result.text.contains('ad2.ts'), isFalse);
++    expect(result.text.contains('x1.ts'), isFalse);
++    expect(result.text.contains('x2.ts'), isFalse);
++  });
++
++  test('shape-only short block is gated without structural signal', () {
++    final playlist = '#EXTM3U\n'
++        '#EXTINF:40.0,\n'
++        'seg000.ts\n'
++        '#EXTINF:5.0,\n'
++        'seg001.ts\n'
++        '#EXTINF:5.0,\n'
++        'seg002.ts\n'
++        '#EXTINF:40.0,\n'
++        'seg003.ts\n'
++        '#EXT-X-ENDLIST\n';
++    final rules = AdFilterRules.parse(
++        '{"heuristics":{"enabled":true,"minAdBlockSegments":2}}');
++    final result = M3u8AdFilter.filter(playlist, 'host', rules);
++    expect(result.removedSegments, 0);
++    expect(result.text.contains('seg001.ts'), isTrue);
++    expect(result.text.contains('seg002.ts'), isTrue);
+   });
+ 
+   test('key-none switch removes clear block on encrypted stream', () {
+     final playlist = '#EXTM3U\n'
+-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
++        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
+         '#EXTINF:10.0,\n'
+         'enc0.ts\n'
+         '#EXT-X-KEY:METHOD=NONE\n'
+@@ -132,9 +176,10 @@ void main() {
+         'clear1.ts\n'
+         '#EXTINF:5.0,\n'
+         'clear2.ts\n'
+-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
++        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
+         '#EXTINF:10.0,\n'
+-        'enc1.ts\n';
++        'enc1.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"heuristics":{"enabled":true,"minAdBlockSegments":2,"keyNoneSwitch":true}}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+@@ -145,6 +190,12 @@ void main() {
+ 
+   test('mirror reuse removes repeated ad-loop URI', () {
+     final playlist = '#EXTM3U\n'
++        '#EXTINF:10.0,\n'
++        'c1.ts\n'
++        '#EXTINF:10.0,\n'
++        'c2.ts\n'
++        '#EXTINF:10.0,\n'
++        'c3.ts\n'
+         '#EXTINF:5.0,\n'
+         'loop.ts\n'
+         '#EXTINF:5.0,\n'
+@@ -152,20 +203,17 @@ void main() {
+         '#EXTINF:5.0,\n'
+         'loop.ts\n'
+         '#EXTINF:10.0,\n'
+-        'c1.ts\n'
+-        '#EXTINF:10.0,\n'
+-        'c2.ts\n'
+-        '#EXTINF:10.0,\n'
+-        'c3.ts\n';
++        'c4.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"heuristics":{"enabled":true,"mirrorReuse":true}}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+     expect(result.removedSegments, 3);
+     expect(result.text.contains('c1.ts'), isTrue);
+-    expect(result.text.contains('c2.ts'), isTrue);
++    expect(result.text.contains('c4.ts'), isTrue);
+   });
+ 
+-  test('url prefix anomaly removes off-prefix block', () {
++  test('host anomaly removes off-host ad block', () {
+     final playlist = '#EXTM3U\n'
+         '#EXTINF:10.0,\n'
+         'https://cdn.test/a/0.ts\n'
+@@ -174,7 +222,8 @@ void main() {
+         '#EXTINF:5.0,\n'
+         'https://ads.test/ad/2.ts\n'
+         '#EXTINF:10.0,\n'
+-        'https://cdn.test/a/1.ts\n';
++        'https://cdn.test/a/1.ts\n'
++        '#EXT-X-ENDLIST\n';
+     final rules = AdFilterRules.parse(
+         '{"heuristics":{"enabled":true,"minAdBlockSegments":2,"urlPrefixAnomaly":true}}');
+     final result = M3u8AdFilter.filter(playlist, 'host', rules);
+@@ -182,6 +231,27 @@ void main() {
+     expect(result.text.contains('cdn.test'), isTrue);
+   });
+ 
++  test('private comment marker removes bounded ad block', () {
++    final playlist = '#EXTM3U\n'
++        '#EXTINF:10.0,\n'
++        'seg0.ts\n'
++        '# ppvod-ad-injected v1\n'
++        '#EXT-X-DISCONTINUITY\n'
++        '#EXTINF:4,\n'
++        '/20261003/84_9109598f/2000k/hls/1.ts\n'
++        '#EXTINF:4,\n'
++        '/20261003/84_9109598f/2000k/hls/2.ts\n'
++        '#EXT-X-DISCONTINUITY\n'
++        '#EXTINF:10.0,\n'
++        'seg1.ts\n'
++        '#EXT-X-ENDLIST\n';
++    final result = M3u8AdFilter.filter(playlist, 'host', AdFilterRules.empty());
++    expect(result.removedSegments, 2);
++    expect(result.text.contains('84_9109598f'), isFalse);
++    expect(result.text.contains('seg0.ts'), isTrue);
++    expect(result.text.contains('seg1.ts'), isTrue);
++  });
++
+   test('XC.json maps host-scoped regex rules', () {
+     final xc =
+         '[{"name":"site","host":"example.com","filter":"/ad/\\nsponsor"}]';

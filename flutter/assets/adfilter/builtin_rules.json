@@ -13,6 +13,7 @@
   "playlistRules": [
     {"type": "regex", "pattern": "/ad/"},
     {"type": "regex", "pattern": "/ads/"},
+    {"type": "regex", "pattern": "/adv/"},
     {"type": "regex", "pattern": "_ad_"},
     {"type": "regex", "pattern": "_ads_"},
     {"type": "regex", "pattern": "/adjump"},
@@ -68,6 +69,8 @@
     "maxAdBlockDurationSec": 30,
     "minAdBlockSegments": 2,
     "maxAdBlockSegments": 8,
+    "maxAdBlockTotalSec": 36,
+    "requireStructural": true,
     "urlPrefixAnomaly": false,
     "keyNoneSwitch": true,
     "mirrorReuse": false,

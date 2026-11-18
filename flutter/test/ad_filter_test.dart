@@ -24,7 +24,8 @@ void main() {
         '#EXTINF:5.0,\n'
         'ad_seg2.ts\n'
         '#EXTINF:10.0,\n'
-        'seg1.ts\n';
+        'seg1.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
@@ -41,7 +42,8 @@ void main() {
         '#EXTINF:5.0,\n'
         'ad_1.ts\n'
         '#EXTINF:10.0,\n'
-        'content.ts\n';
+        'content.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"playlistRules":[{"type":"keyword","pattern":"ad_"}]}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
@@ -51,7 +53,10 @@ void main() {
     expect(result.text.contains('content.ts'), isTrue);
   });
 
-  test('encrypted stream skips rule-based removal', () {
+  test('implicit-IV stream is left untouched', () {
+    // AES-128 without an explicit IV derives each IV from the sequence number:
+    // deleting any segment shifts every following IV, so the whole playlist is
+    // left untouched.
     final playlist = '#EXTM3U\n'
         '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
         '#EXTINF:10.0,\n'
@@ -59,11 +64,29 @@ void main() {
         '#EXTINF:5.0,\n'
         'ad_seg.ts\n'
         '#EXTINF:10.0,\n'
-        'enc1.ts\n';
+        'enc1.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
     expect(result.removedSegments, 0);
+  });
+
+  test('explicit IV allows rule-based removal', () {
+    final playlist = '#EXTM3U\n'
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
+        '#EXTINF:10.0,\n'
+        'enc0.ts\n'
+        '#EXTINF:5.0,\n'
+        'ad_seg.ts\n'
+        '#EXTINF:10.0,\n'
+        'enc1.ts\n'
+        '#EXT-X-ENDLIST\n';
+    final rules = AdFilterRules.parse(
+        '{"playlistRules":[{"type":"keyword","pattern":"ad_seg"}]}');
+    final result = M3u8AdFilter.filter(playlist, 'host', rules);
+    expect(result.removedSegments, 1);
+    expect(result.text.contains('ad_seg.ts'), isFalse);
   });
 
   test('SCTE/CUE-OUT removes marked ad block', () {
@@ -77,7 +100,8 @@ void main() {
         'ad2.ts\n'
         '#EXT-X-CUE-IN\n'
         '#EXTINF:10.0,\n'
-        'seg1.ts\n';
+        'seg1.ts\n'
+        '#EXT-X-ENDLIST\n';
     final result = M3u8AdFilter.filter(playlist, 'host', AdFilterRules.empty());
     expect(result.removedSegments, 2);
     expect(result.text.contains('ad1.ts'), isFalse);
@@ -98,33 +122,53 @@ void main() {
       buffer.write('#EXTINF:10.0,\n');
       buffer.write('s$i.ts\n');
     }
+    buffer.write('#EXT-X-ENDLIST\n');
     final rules = AdFilterRules.parse('{"heuristics":{"enabled":true}}');
     final result = M3u8AdFilter.filter(buffer.toString(), 'host', rules);
     expect(result.removedSegments, 0);
   });
 
-  test('opt-in duration window removes bounded short block', () {
+  test('chunk scoring removes naming-island short block', () {
     final playlist = '#EXTM3U\n'
         '#EXTINF:40.0,\n'
         'a.ts\n'
         '#EXTINF:5.0,\n'
-        'ad1.ts\n'
+        'x1.ts\n'
         '#EXTINF:5.0,\n'
-        'ad2.ts\n'
+        'x2.ts\n'
         '#EXTINF:40.0,\n'
-        'b.ts\n';
+        'b.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
-        '{"heuristics":{"enabled":true,"durationWindows":true,'
-        '"minAdBlockSegments":2}}');
+        '{"heuristics":{"enabled":true,"minAdBlockSegments":2}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
     expect(result.removedSegments, 2);
-    expect(result.text.contains('ad1.ts'), isFalse);
-    expect(result.text.contains('ad2.ts'), isFalse);
+    expect(result.text.contains('x1.ts'), isFalse);
+    expect(result.text.contains('x2.ts'), isFalse);
+  });
+
+  test('shape-only short block is gated without structural signal', () {
+    final playlist = '#EXTM3U\n'
+        '#EXTINF:40.0,\n'
+        'seg000.ts\n'
+        '#EXTINF:5.0,\n'
+        'seg001.ts\n'
+        '#EXTINF:5.0,\n'
+        'seg002.ts\n'
+        '#EXTINF:40.0,\n'
+        'seg003.ts\n'
+        '#EXT-X-ENDLIST\n';
+    final rules = AdFilterRules.parse(
+        '{"heuristics":{"enabled":true,"minAdBlockSegments":2}}');
+    final result = M3u8AdFilter.filter(playlist, 'host', rules);
+    expect(result.removedSegments, 0);
+    expect(result.text.contains('seg001.ts'), isTrue);
+    expect(result.text.contains('seg002.ts'), isTrue);
   });
 
   test('key-none switch removes clear block on encrypted stream', () {
     final playlist = '#EXTM3U\n'
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
         '#EXTINF:10.0,\n'
         'enc0.ts\n'
         '#EXT-X-KEY:METHOD=NONE\n'
@@ -132,9 +176,10 @@ void main() {
         'clear1.ts\n'
         '#EXTINF:5.0,\n'
         'clear2.ts\n'
-        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+        '#EXT-X-KEY:METHOD=AES-128,URI="key.bin",IV=0x00000000000000000000000000000000\n'
         '#EXTINF:10.0,\n'
-        'enc1.ts\n';
+        'enc1.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"heuristics":{"enabled":true,"minAdBlockSegments":2,"keyNoneSwitch":true}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
@@ -145,27 +190,30 @@ void main() {
 
   test('mirror reuse removes repeated ad-loop URI', () {
     final playlist = '#EXTM3U\n'
-        '#EXTINF:5.0,\n'
-        'loop.ts\n'
-        '#EXTINF:5.0,\n'
-        'loop.ts\n'
-        '#EXTINF:5.0,\n'
-        'loop.ts\n'
         '#EXTINF:10.0,\n'
         'c1.ts\n'
         '#EXTINF:10.0,\n'
         'c2.ts\n'
         '#EXTINF:10.0,\n'
-        'c3.ts\n';
+        'c3.ts\n'
+        '#EXTINF:5.0,\n'
+        'loop.ts\n'
+        '#EXTINF:5.0,\n'
+        'loop.ts\n'
+        '#EXTINF:5.0,\n'
+        'loop.ts\n'
+        '#EXTINF:10.0,\n'
+        'c4.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"heuristics":{"enabled":true,"mirrorReuse":true}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
     expect(result.removedSegments, 3);
     expect(result.text.contains('c1.ts'), isTrue);
-    expect(result.text.contains('c2.ts'), isTrue);
+    expect(result.text.contains('c4.ts'), isTrue);
   });
 
-  test('url prefix anomaly removes off-prefix block', () {
+  test('host anomaly removes off-host ad block', () {
     final playlist = '#EXTM3U\n'
         '#EXTINF:10.0,\n'
         'https://cdn.test/a/0.ts\n'
@@ -174,12 +222,34 @@ void main() {
         '#EXTINF:5.0,\n'
         'https://ads.test/ad/2.ts\n'
         '#EXTINF:10.0,\n'
-        'https://cdn.test/a/1.ts\n';
+        'https://cdn.test/a/1.ts\n'
+        '#EXT-X-ENDLIST\n';
     final rules = AdFilterRules.parse(
         '{"heuristics":{"enabled":true,"minAdBlockSegments":2,"urlPrefixAnomaly":true}}');
     final result = M3u8AdFilter.filter(playlist, 'host', rules);
     expect(result.removedSegments, 2);
     expect(result.text.contains('cdn.test'), isTrue);
+  });
+
+  test('private comment marker removes bounded ad block', () {
+    final playlist = '#EXTM3U\n'
+        '#EXTINF:10.0,\n'
+        'seg0.ts\n'
+        '# ppvod-ad-injected v1\n'
+        '#EXT-X-DISCONTINUITY\n'
+        '#EXTINF:4,\n'
+        '/20261003/84_9109598f/2000k/hls/1.ts\n'
+        '#EXTINF:4,\n'
+        '/20261003/84_9109598f/2000k/hls/2.ts\n'
+        '#EXT-X-DISCONTINUITY\n'
+        '#EXTINF:10.0,\n'
+        'seg1.ts\n'
+        '#EXT-X-ENDLIST\n';
+    final result = M3u8AdFilter.filter(playlist, 'host', AdFilterRules.empty());
+    expect(result.removedSegments, 2);
+    expect(result.text.contains('84_9109598f'), isFalse);
+    expect(result.text.contains('seg0.ts'), isTrue);
+    expect(result.text.contains('seg1.ts'), isTrue);
   });
 
   test('XC.json maps host-scoped regex rules', () {
