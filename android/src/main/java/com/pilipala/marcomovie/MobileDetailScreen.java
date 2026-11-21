@@ -575,7 +575,7 @@ final class MobileDetailScreen {
                 Math.max(a.dp(510), Math.min(a.dp(660), Math.round(posterWindowH * 0.81f)));
         final int initAmbient = defaultAmbientForTitle(listing.title);
 
-        a.root = new FrameLayout(a);
+        a.root = a.newGlassBackdropRoot();
         a.root.setBackgroundColor(initAmbient);
         a.setContentView(a.root);
 
@@ -625,6 +625,12 @@ final class MobileDetailScreen {
                         () -> backdropView.setScrollOffset(scrollView.getScrollY()));
         a.scroll = scrollView;
         a.root.addView(scrollView, new FrameLayout.LayoutParams(-1, -1));
+        android.graphics.Rect pendingOrigin = a.consumePendingDetailOrigin();
+        if (pendingOrigin != null) {
+            a.activeTransition =
+                    PlayerTransitionHelper.animateSharedBoundsEnter(
+                            a.root, backdropView, pendingOrigin, a.reduced, null);
+        }
 
         LinearLayout mainCol = a.vertical();
         mainCol.setPadding(0, 0, 0, a.dp(46));
@@ -702,6 +708,19 @@ final class MobileDetailScreen {
                 ratings ->
                         updateRatingBadges(
                                 doubanBadge, rtBadge, listing, ratings.douban, ratings.rtPercent));
+
+        final MediaBadgeView.BadgeFlowLayout specBadgeRow =
+                MediaBadgeView.createRow(a, "detail-spec-badges", true);
+        LinearLayout.LayoutParams specRowLp = new LinearLayout.LayoutParams(-1, -2);
+        specRowLp.topMargin = a.dp(8);
+        heroCenterCol.addView(specBadgeRow, specRowLp);
+        MediaBadgeView.populateRow(
+                a,
+                specBadgeRow,
+                MediaBadgeView.extractForHero(a, listing.remarks, null, null),
+                MediaBadgeView.HERO_MAX_BADGES,
+                false,
+                false);
 
         // 2B. Lower Content Column (Synopsis + White Capsule Play Button + Episodes Section)
         LinearLayout lowerBody = a.vertical();
@@ -925,6 +944,13 @@ final class MobileDetailScreen {
                     }
 
                     if (v.lines.isEmpty()) {
+                        MediaBadgeView.populateRow(
+                                a,
+                                specBadgeRow,
+                                MediaBadgeView.extractForHero(a, v.remarks, null, null),
+                                MediaBadgeView.HERO_MAX_BADGES,
+                                false,
+                                false);
                         sourceTopBtn.setText("⇄ " + s.name);
                         TextView empty = a.text("暂未获取到可播放的剧集资源", 14, 0xb3ffffff);
                         empty.setGravity(Gravity.CENTER);
@@ -1165,6 +1191,18 @@ final class MobileDetailScreen {
                             }
                         });
             }
+            View heroSpecView = a.root.findViewWithTag("detail-spec-badges");
+            if (heroSpecView instanceof android.view.ViewGroup) {
+                Cms.Episode activeEp =
+                        line.episodes.isEmpty() ? null : line.episodes.get(activeEpIdx);
+                MediaBadgeView.populateRow(
+                        a,
+                        (android.view.ViewGroup) heroSpecView,
+                        MediaBadgeView.extractForHero(a, video.remarks, line, activeEp),
+                        MediaBadgeView.HERO_MAX_BADGES,
+                        false,
+                        false);
+            }
             View topSourceView = a.root.findViewWithTag("detail-source-picker");
             if (topSourceView instanceof TextView) {
                 TextView sourceTopBtn = (TextView) topSourceView;
@@ -1174,8 +1212,15 @@ final class MobileDetailScreen {
                             String[] names = new String[video.lines.size()];
                             for (int i = 0; i < video.lines.size(); i++) {
                                 Cms.Line l = video.lines.get(i);
+                                String lineSpec =
+                                        MediaBadges.formatDotJoined(
+                                                MediaBadgeView.extractForLineOnly(a, l, null),
+                                                MediaBadgeView.LINE_PICKER_MAX_BADGES);
                                 names[i] =
                                         l.name
+                                                + (lineSpec.isEmpty()
+                                                        ? ""
+                                                        : ("  [" + lineSpec + "]"))
                                                 + "  (共 "
                                                 + l.episodes.size()
                                                 + " 集 · "

@@ -1,7 +1,15 @@
+import 'dart:async';
 import 'windows_appearance.dart';
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, kIsWeb;
 import 'package:flutter/material.dart' show Colors, Material, MaterialType;
+import '../core/danmu/danmu_prefs.dart';
+import '../core/ohos_runtime.dart';
 import 'apple_theme.dart';
+import 'danmu/danmu_settings_sheet.dart';
+import 'ios_liquid_glass.dart';
+import 'player/player_hud_prefs.dart';
 
 class SettingsPane {
   final String id, title, subtitle;
@@ -46,9 +54,30 @@ class IosSettingsPage extends StatefulWidget {
 
 class _IosSettingsPageState extends State<IosSettingsPage> {
   final ValueNotifier<int> _revision = ValueNotifier<int>(0);
+  final ScrollController _scrollController = ScrollController();
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
+  bool _showCompactNavBar = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _scrollController.addListener(_handleScroll);
+  }
+
+  void _handleScroll() {
+    if (!_scrollController.hasClients) return;
+    final next = _scrollController.offset > 52;
+    if (next != _showCompactNavBar && mounted) {
+      setState(() => _showCompactNavBar = next);
+    }
+  }
 
   @override
   void dispose() {
+    _scrollController.removeListener(_handleScroll);
+    _scrollController.dispose();
+    _searchController.dispose();
     _revision.dispose();
     super.dispose();
   }
@@ -59,14 +88,18 @@ class _IosSettingsPageState extends State<IosSettingsPage> {
     widget.onChanged();
   }
 
-  void _openRootPane(BuildContext context, SettingsPane entry) {
+  void _openPanePath(
+    BuildContext context,
+    List<String> pathIds, {
+    String parentTitle = '设置',
+  }) {
     Navigator.of(context)
         .push<void>(
           buildApplePageRoute<void>(
             builder: (_) => IosSettingsSubPage(
               pages: widget.pages,
-              pathIds: [entry.id],
-              parentTitle: '设置',
+              pathIds: pathIds,
+              parentTitle: parentTitle,
               revision: _revision,
               onChanged: _notifyChanged,
             ),
@@ -75,6 +108,10 @@ class _IosSettingsPageState extends State<IosSettingsPage> {
         .then((_) {
           if (mounted) setState(() {});
         });
+  }
+
+  void _openRootPane(BuildContext context, SettingsPane entry) {
+    _openPanePath(context, [entry.id], parentTitle: '设置');
   }
 
   List<List<SettingsPane>> _groupEntries(List<SettingsPane> entries) {
@@ -90,59 +127,269 @@ class _IosSettingsPageState extends State<IosSettingsPage> {
     return groups;
   }
 
+  String? _sectionHeaderFor(String group) => switch (group) {
+    'core' => '偏好与视听体验',
+    'account' => '片源、扩展与数据',
+    'about' => '应用信息',
+    _ => null,
+  };
+
+  List<({SettingsPane pane, List<String> pathIds, String breadcrumb})>
+  _searchMatches(List<SettingsPane> roots, String rawQuery) {
+    final q = rawQuery.trim().toLowerCase();
+    if (q.isEmpty) return const [];
+    final hits =
+        <({SettingsPane pane, List<String> pathIds, String breadcrumb})>[];
+    for (final root in roots) {
+      final rootMatch =
+          root.title.toLowerCase().contains(q) ||
+          root.subtitle.toLowerCase().contains(q) ||
+          (root.trailingText?.toLowerCase().contains(q) ?? false);
+      if (rootMatch) {
+        hits.add((pane: root, pathIds: [root.id], breadcrumb: root.subtitle));
+      }
+      for (final child in root.children) {
+        final childMatch =
+            child.title.toLowerCase().contains(q) ||
+            child.subtitle.toLowerCase().contains(q) ||
+            (child.trailingText?.toLowerCase().contains(q) ?? false);
+        if (childMatch) {
+          hits.add((
+            pane: child,
+            pathIds: [root.id, child.id],
+            breadcrumb: '${root.title} · ${child.subtitle}',
+          ));
+        }
+      }
+    }
+    return hits;
+  }
+
+  Widget _buildIos26SearchPill() {
+    return Container(
+      key: const ValueKey('ios-settings-search'),
+      height: 36,
+      decoration: BoxDecoration(
+        color: const Color(0xEB1C1C1E),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: const Color(0x1EFFFFFF),
+          width: 0.6,
+        ),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(
+        children: [
+          const Icon(
+            CupertinoIcons.search,
+            color: Color(0x99EBEBF5),
+            size: 16,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: CupertinoTextField(
+              controller: _searchController,
+              placeholder: '搜索设置',
+              placeholderStyle: const TextStyle(
+                color: Color(0x8CEBEBF5),
+                fontSize: 15,
+              ),
+              style: const TextStyle(
+                color: AppleColors.labelPrimary,
+                fontSize: 15,
+              ),
+              padding: EdgeInsets.zero,
+              decoration: null,
+              clearButtonMode: OverlayVisibilityMode.never,
+              onChanged: (v) => setState(() => _searchQuery = v),
+            ),
+          ),
+          if (_searchQuery.isNotEmpty)
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () {
+                _searchController.clear();
+                setState(() => _searchQuery = '');
+              },
+              child: const Padding(
+                padding: EdgeInsets.only(left: 6),
+                child: Icon(
+                  CupertinoIcons.clear_circled_solid,
+                  color: Color(0x99EBEBF5),
+                  size: 17,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
-    final safeBottom = MediaQuery.paddingOf(context).bottom;
+    final mediaPadding = MediaQuery.paddingOf(context);
+    final safeBottom = mediaPadding.bottom;
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final isWide = screenWidth >= 600;
+    final hPad = isWide ? 24.0 : 16.0;
+    final groupGap = isWide ? 22.0 : 16.0;
     final entries = widget.pages(_notifyChanged);
     final grouped = _groupEntries(entries);
-    return SafeArea(
-      bottom: false,
-      child: ListView(
-        key: const ValueKey('ios-settings-root'),
-        padding: EdgeInsets.fromLTRB(16, 10, 16, safeBottom + 104),
-        children: [
-          Align(
-            alignment: Alignment.topCenter,
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 680),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Padding(
-                    padding: EdgeInsets.fromLTRB(4, 2, 4, 14),
-                    child: Text(
-                      '设置',
-                      style: TextStyle(
-                        color: AppleColors.labelPrimary,
-                        fontSize: 34,
-                        fontWeight: FontWeight.w700,
-                        letterSpacing: -0.6,
+    final query = _searchQuery.trim();
+    final searchHits = query.isNotEmpty
+        ? _searchMatches(entries, query)
+        : const <
+            ({SettingsPane pane, List<String> pathIds, String breadcrumb})
+          >[];
+
+    return Stack(
+      children: [
+        SafeArea(
+          bottom: false,
+          child: ListView(
+            key: const ValueKey('ios-settings-root'),
+            controller: _scrollController,
+            keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+            physics: const BouncingScrollPhysics(
+              parent: AlwaysScrollableScrollPhysics(),
+            ),
+            padding: EdgeInsets.fromLTRB(hPad, 6, hPad, safeBottom + 108),
+            children: [
+              Align(
+                alignment: Alignment.topCenter,
+                child: ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 740),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Padding(
+                        padding: EdgeInsets.fromLTRB(4, 2, 4, 8),
+                        child: Text(
+                          '设置',
+                          style: TextStyle(
+                            color: AppleColors.labelPrimary,
+                            fontSize: 34,
+                            fontWeight: FontWeight.w700,
+                            letterSpacing: -0.6,
+                            height: 1.15,
+                          ),
+                        ),
+                      ),
+                      _buildIos26SearchPill(),
+                      const SizedBox(height: 14),
+                      if (query.isNotEmpty) ...[
+                        if (searchHits.isEmpty)
+                          const Padding(
+                            padding: EdgeInsets.symmetric(vertical: 36),
+                            child: Center(
+                              child: Text(
+                                '未找到匹配的设置项',
+                                style: TextStyle(
+                                  color: Color(0x8CEBEBF5),
+                                  fontSize: 15,
+                                ),
+                              ),
+                            ),
+                          )
+                        else
+                          IosSettingsGroup(
+                            header: '搜索结果 (${searchHits.length})',
+                            children: [
+                              for (final hit in searchHits)
+                                IosSettingsRow(
+                                  icon: hit.pane.icon,
+                                  iconColor: hit.pane.color,
+                                  title: hit.pane.title,
+                                  subtitle: hit.breadcrumb.isNotEmpty
+                                      ? hit.breadcrumb
+                                      : null,
+                                  subtitleMaxLines: 1,
+                                  trailingText: hit.pane.trailingText,
+                                  showChevron: true,
+                                  onTap: () => _openPanePath(
+                                    context,
+                                    hit.pathIds,
+                                    parentTitle: '设置',
+                                  ),
+                                ),
+                            ],
+                          ),
+                      ] else ...[
+                        for (var gIdx = 0; gIdx < grouped.length; gIdx++) ...[
+                          if (gIdx > 0) SizedBox(height: groupGap),
+                          IosSettingsGroup(
+                            header: _sectionHeaderFor(
+                              grouped[gIdx].first.sectionGroup,
+                            ),
+                            children: [
+                              for (final entry in grouped[gIdx])
+                                IosSettingsRow(
+                                  key: ValueKey(
+                                    'settings-category-${entry.id}',
+                                  ),
+                                  icon: entry.icon,
+                                  iconColor: entry.color,
+                                  title: entry.title,
+                                  trailingText: entry.trailingText,
+                                  compact: true,
+                                  showChevron: true,
+                                  onTap: () => _openRootPane(context, entry),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+        // Sticky collapsing inline iOS 26 navigation title bar when scrolled in portrait.
+        if (MediaQuery.sizeOf(context).height >= 500)
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: IgnorePointer(
+              ignoring: true,
+              child: AnimatedOpacity(
+                duration: const Duration(milliseconds: 180),
+                curve: Curves.easeOut,
+                opacity: _showCompactNavBar ? 1.0 : 0.0,
+                child: DecoratedBox(
+                  decoration: const BoxDecoration(
+                    color: Color(0xEB0A0A0D),
+                    border: Border(
+                      bottom: BorderSide(
+                        color: Color(0x2EFFFFFF),
+                        width: 0.5,
                       ),
                     ),
                   ),
-                  for (var gIdx = 0; gIdx < grouped.length; gIdx++) ...[
-                    if (gIdx > 0) const SizedBox(height: 20),
-                    IosSettingsGroup(
-                      children: [
-                        for (final entry in grouped[gIdx])
-                          IosSettingsRow(
-                            key: ValueKey('settings-category-${entry.id}'),
-                            icon: entry.icon,
-                            iconColor: entry.color,
-                            title: entry.title,
-                            trailingText: entry.trailingText,
-                            showChevron: true,
-                            onTap: () => _openRootPane(context, entry),
+                  child: Padding(
+                    padding: EdgeInsets.only(top: mediaPadding.top),
+                    child: const SizedBox(
+                      height: 44,
+                      child: Center(
+                        child: Text(
+                          '设置',
+                          style: TextStyle(
+                            color: AppleColors.labelPrimary,
+                            fontSize: 17,
+                            fontWeight: FontWeight.w600,
+                            letterSpacing: -0.2,
                           ),
-                      ],
+                        ),
+                      ),
                     ),
-                  ],
-                ],
+                  ),
+                ),
               ),
             ),
           ),
-        ],
-      ),
+      ],
     );
   }
 }
@@ -175,59 +422,62 @@ class IosSettingsScaffold extends StatelessWidget {
           children: [
             DecoratedBox(
               decoration: const BoxDecoration(
-                color: Color(0xF0121214),
-                border: Border(
-                  bottom: BorderSide(color: Color(0x33545458), width: 0.5),
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: [
+                    Color(0xF008080A),
+                    Color(0xCC08080A),
+                    Color(0x0008080A),
+                  ],
+                  stops: [0.0, 0.78, 1.0],
                 ),
               ),
               child: Padding(
                 padding: EdgeInsets.only(
-                  top: mediaPadding.top,
-                  left: mediaPadding.left,
-                  right: mediaPadding.right,
+                  top: mediaPadding.top + 4,
+                  bottom: 6,
+                  left: mediaPadding.left + 12,
+                  right: mediaPadding.right + 12,
                 ),
                 child: SizedBox(
-                  height: 44,
+                  height: 42,
                   child: Stack(
                     alignment: Alignment.center,
                     children: [
                       Align(
                         alignment: Alignment.centerLeft,
-                        child: CupertinoButton(
+                        child: IosNativeGlassButton(
                           key: const ValueKey('settings-drawer-back'),
-                          padding: const EdgeInsets.symmetric(horizontal: 8),
-                          minimumSize: const Size(44, 44),
-                          onPressed: () => Navigator.of(context).maybePop(),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              const Icon(
-                                CupertinoIcons.back,
-                                color: AppleColors.systemBlue,
-                                size: 21,
-                              ),
-                              Flexible(
-                                child: ConstrainedBox(
-                                  constraints:
-                                      const BoxConstraints(maxWidth: 112),
-                                  child: Text(
-                                    backLabel,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(
-                                      color: AppleColors.systemBlue,
-                                      fontSize: 16.5,
-                                      fontWeight: FontWeight.w400,
-                                    ),
-                                  ),
+                          style: 'circle',
+                          symbol: 'chevron.backward',
+                          symbolSize: 17,
+                          width: 40,
+                          height: 40,
+                          accessibilityLabel: backLabel,
+                          onTap: () => Navigator.of(context).maybePop(),
+                          fallback: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onTap: () => Navigator.of(context).maybePop(),
+                            child: const LiquidGlass(
+                              width: 40,
+                              height: 40,
+                              borderRadius: 20,
+                              elevated: false,
+                              tint: Color(0x521E1E22),
+                              child: Center(
+                                child: Icon(
+                                  CupertinoIcons.back,
+                                  color: AppleColors.labelPrimary,
+                                  size: 20,
                                 ),
                               ),
-                            ],
+                            ),
                           ),
                         ),
                       ),
                       Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 116),
+                        padding: const EdgeInsets.symmetric(horizontal: 64),
                         child: Text(
                           title,
                           maxLines: 1,
@@ -244,10 +494,7 @@ class IosSettingsScaffold extends StatelessWidget {
                       if (trailing != null)
                         Align(
                           alignment: Alignment.centerRight,
-                          child: Padding(
-                            padding: const EdgeInsets.only(right: 6),
-                            child: trailing!,
-                          ),
+                          child: trailing!,
                         ),
                     ],
                   ),
@@ -258,7 +505,7 @@ class IosSettingsScaffold extends StatelessWidget {
               child: SafeArea(
                 top: false,
                 bottom: false,
-                child: body,
+                child: RepaintBoundary(child: body),
               ),
             ),
           ],
@@ -337,17 +584,19 @@ class _IosSettingsSubPageState extends State<IosSettingsSubPage> {
       builder: (context, _, __) {
         final pane = _resolveCurrentPane();
         final safeBottom = MediaQuery.paddingOf(context).bottom;
+        final screenWidth = MediaQuery.sizeOf(context).width;
+        final hPad = screenWidth >= 600 ? 24.0 : 18.0;
         return IosSettingsScaffold(
           title: pane.title,
           backLabel: widget.parentTitle,
           body: ListView(
             key: ValueKey('settings-page-${pane.id}'),
-            padding: EdgeInsets.fromLTRB(16, 18, 16, safeBottom + 32),
+            padding: EdgeInsets.fromLTRB(hPad, 22, hPad, safeBottom + 40),
             children: [
               Align(
                 alignment: Alignment.topCenter,
                 child: ConstrainedBox(
-                  constraints: const BoxConstraints(maxWidth: 680),
+                  constraints: const BoxConstraints(maxWidth: 740),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
@@ -370,7 +619,7 @@ class _IosSettingsSubPageState extends State<IosSettingsSubPage> {
                               ),
                           ],
                         ),
-                        if (pane.content != null) const SizedBox(height: 20),
+                        if (pane.content != null) const SizedBox(height: 24),
                       ],
                       if (pane.content != null) pane.content!,
                     ],
@@ -385,7 +634,8 @@ class _IosSettingsSubPageState extends State<IosSettingsSubPage> {
   }
 }
 
-/// Native iOS System Settings inset-grouped table section (`#1C1C1E` rounded card with `0.5pt` hairlines).
+/// Native iOS 26 System Settings inset-grouped table section (`#1C1C1E` 22pt
+/// rounded card with `0.5pt` `#38383A` hairlines).
 class IosSettingsGroup extends StatelessWidget {
   final String? header;
   final String? footer;
@@ -412,8 +662,8 @@ class IosSettingsGroup extends StatelessWidget {
         separated.add(
           Container(
             height: 0.5,
-            margin: EdgeInsets.only(left: dividerIndent),
-            color: const Color(0x38545458),
+            margin: EdgeInsets.only(left: dividerIndent, right: 16),
+            color: const Color(0xA638383A),
           ),
         );
       }
@@ -429,20 +679,20 @@ class IosSettingsGroup extends StatelessWidget {
               style: const TextStyle(
                 color: Color(0x99EBEBF5),
                 fontSize: 13,
-                fontWeight: FontWeight.w400,
-                letterSpacing: -0.05,
+                fontWeight: FontWeight.w500,
+                letterSpacing: 0.1,
               ),
             ),
           ),
         ClipRRect(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(22),
           child: DecoratedBox(
             decoration: BoxDecoration(
-              color: const Color(0xFF1C1C1E),
-              borderRadius: BorderRadius.circular(12),
+              color: const Color(0xF51C1C1E),
+              borderRadius: BorderRadius.circular(22),
               border: Border.all(
-                color: const Color(0x16FFFFFF),
-                width: 0.5,
+                color: const Color(0x1EFFFFFF),
+                width: 0.55,
               ),
             ),
             child: Column(
@@ -454,13 +704,13 @@ class IosSettingsGroup extends StatelessWidget {
         ),
         if (footer != null && footer!.isNotEmpty)
           Padding(
-            padding: const EdgeInsets.only(left: 16, right: 16, top: 7),
+            padding: const EdgeInsets.only(left: 16, right: 16, top: 8),
             child: Text(
               footer!,
               style: const TextStyle(
-                color: Color(0x99EBEBF5),
+                color: Color(0x8CEBEBF5),
                 fontSize: 12.5,
-                height: 1.4,
+                height: 1.45,
               ),
             ),
           ),
@@ -469,16 +719,18 @@ class IosSettingsGroup extends StatelessWidget {
   }
 }
 
-/// Native iOS System Settings cell with optional vivid squircle icon badge, title,
-/// optional subtitle, right-side detail text, or disclosure chevron.
+/// Native iOS 26 System Settings cell with optional vivid `30×30` squircle icon
+/// badge, title, optional subtitle, right-side detail text, or disclosure chevron.
 class IosSettingsRow extends StatefulWidget {
   final IconData? icon;
   final Color iconColor;
   final String title;
   final Color? titleColor;
   final String? subtitle;
+  final int subtitleMaxLines;
   final String? trailingText;
   final Widget? trailing;
+  final bool compact;
   final bool showChevron;
   final VoidCallback? onTap;
 
@@ -489,8 +741,10 @@ class IosSettingsRow extends StatefulWidget {
     required this.title,
     this.titleColor,
     this.subtitle,
+    this.subtitleMaxLines = 2,
     this.trailingText,
     this.trailing,
+    this.compact = false,
     this.showChevron = false,
     this.onTap,
   });
@@ -509,29 +763,53 @@ class _IosSettingsRowState extends State<IosSettingsRow> {
           subtitle: widget.subtitle, icon: widget.icon, value: widget.trailingText,
           trailing: widget.trailing, onTap: widget.onTap);
     }
+    final hasSubtitle = widget.subtitle != null && widget.subtitle!.isNotEmpty;
+    final minHeight = hasSubtitle
+        ? 58.0
+        : (widget.compact ? 46.0 : 50.0);
+    final vPad = hasSubtitle
+        ? 10.5
+        : (widget.compact ? 8.5 : 10.5);
     final row = ColoredBox(
       color: _pressed ? const Color(0xFF2C2C2E) : const Color(0x00000000),
       child: ConstrainedBox(
-        constraints: const BoxConstraints(minHeight: 46),
+        constraints: BoxConstraints(minHeight: minHeight),
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: EdgeInsets.symmetric(
+            horizontal: 16,
+            vertical: vPad,
+          ),
           child: Row(
             children: [
               if (widget.icon != null) ...[
                 DecoratedBox(
                   decoration: ShapeDecoration(
-                    color: widget.iconColor,
+                    gradient: LinearGradient(
+                      begin: Alignment.topCenter,
+                      end: Alignment.bottomCenter,
+                      colors: [
+                        Color.alphaBlend(
+                          const Color(0x28FFFFFF),
+                          widget.iconColor,
+                        ),
+                        widget.iconColor,
+                      ],
+                    ),
                     shape: RoundedSuperellipseBorder(
-                      borderRadius: BorderRadius.circular(7),
+                      borderRadius: BorderRadius.circular(7.5),
+                      side: const BorderSide(
+                        color: Color(0x28FFFFFF),
+                        width: 0.5,
+                      ),
                     ),
                   ),
                   child: SizedBox(
-                    width: 29,
-                    height: 29,
-                    child: Icon(widget.icon, color: Colors.white, size: 17),
+                    width: 30,
+                    height: 30,
+                    child: Icon(widget.icon, color: Colors.white, size: 16.5),
                   ),
                 ),
-                const SizedBox(width: 13),
+                const SizedBox(width: 12),
               ],
               Expanded(
                 child: Column(
@@ -542,17 +820,16 @@ class _IosSettingsRowState extends State<IosSettingsRow> {
                       widget.title,
                       style: TextStyle(
                         color: widget.titleColor ?? AppleColors.labelPrimary,
-                        fontSize: 16,
+                        fontSize: 16.5,
                         fontWeight: FontWeight.w400,
                         letterSpacing: -0.2,
                       ),
                     ),
-                    if (widget.subtitle != null &&
-                        widget.subtitle!.isNotEmpty) ...[
-                      const SizedBox(height: 2),
+                    if (hasSubtitle) ...[
+                      const SizedBox(height: 2.5),
                       Text(
                         widget.subtitle!,
-                        maxLines: 2,
+                        maxLines: widget.subtitleMaxLines,
                         overflow: TextOverflow.ellipsis,
                         style: const TextStyle(
                           color: Color(0x99EBEBF5),
@@ -570,14 +847,14 @@ class _IosSettingsRowState extends State<IosSettingsRow> {
                 Flexible(
                   flex: 0,
                   child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 160),
+                    constraints: const BoxConstraints(maxWidth: 148),
                     child: Text(
                       widget.trailingText!,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(
                         color: Color(0x99EBEBF5),
-                        fontSize: 15.5,
+                        fontSize: 15,
                         fontWeight: FontWeight.w400,
                       ),
                     ),
@@ -585,7 +862,7 @@ class _IosSettingsRowState extends State<IosSettingsRow> {
                 ),
               ],
               if (widget.trailing != null) ...[
-                const SizedBox(width: 8),
+                const SizedBox(width: 10),
                 widget.trailing!,
               ] else if (widget.showChevron) ...[
                 const SizedBox(width: 6),
@@ -615,7 +892,8 @@ class _IosSettingsRowState extends State<IosSettingsRow> {
   }
 }
 
-/// Native iOS System Settings switch row (`CupertinoSwitch`).
+/// Native iOS 26 System Settings switch row backed by genuine UIKit `UISwitch`
+/// (with Liquid Glass expanding thumb on iOS 26+) and `CupertinoSwitch` fallback.
 class IosSettingsSwitchRow extends StatelessWidget {
   final IconData? icon;
   final Color iconColor;
@@ -641,9 +919,10 @@ class IosSettingsSwitchRow extends StatelessWidget {
       iconColor: iconColor,
       title: title,
       subtitle: subtitle,
-      trailing: CupertinoSwitch(
+      trailing: IosNativeSwitch(
         value: value,
-        activeTrackColor: AppleColors.systemGreen,
+        activeColor: AppleColors.systemGreen,
+        accessibilityLabel: title,
         onChanged: onChanged,
       ),
     );
@@ -684,9 +963,9 @@ class _IosSettingsChoiceTileState extends State<IosSettingsChoiceTile> {
         child: ColoredBox(
           color: _pressed ? const Color(0xFF2C2C2E) : const Color(0x00000000),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(minHeight: 46),
+            constraints: const BoxConstraints(minHeight: 50),
             child: Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               child: Row(
                 children: [
                   Expanded(
@@ -694,7 +973,7 @@ class _IosSettingsChoiceTileState extends State<IosSettingsChoiceTile> {
                       widget.label,
                       style: const TextStyle(
                         color: AppleColors.labelPrimary,
-                        fontSize: 16,
+                        fontSize: 16.5,
                         fontWeight: FontWeight.w400,
                         letterSpacing: -0.2,
                       ),
@@ -704,7 +983,7 @@ class _IosSettingsChoiceTileState extends State<IosSettingsChoiceTile> {
                     const Icon(
                       CupertinoIcons.checkmark_alt,
                       color: AppleColors.systemBlue,
-                      size: 19,
+                      size: 19.5,
                     ),
                 ],
               ),
@@ -732,11 +1011,11 @@ class SettingsChoices<T> extends StatelessWidget {
   });
   @override
   Widget build(BuildContext context) => Padding(
-        padding: const EdgeInsets.only(bottom: 20),
+        padding: const EdgeInsets.only(bottom: 24),
         child: IosSettingsGroup(
           header: title,
           footer: footer,
-          dividerIndent: 16,
+          dividerIndent: 18,
           children: [
             for (final choice in choices)
               IosSettingsChoiceTile(
@@ -748,4 +1027,236 @@ class SettingsChoices<T> extends StatelessWidget {
           ],
         ),
       );
+}
+
+/// Global Danmaku settings section using [IosSettingsSwitchRow] (`IosNativeSwitch`
+/// on iOS 26+, `CupertinoSwitch` fallback elsewhere). Guarded with `!OhosRuntime.isOhos`.
+class IosDanmuSettingsSection extends StatefulWidget {
+  final DanmuSettings? initialSettingsOverride;
+  final VoidCallback? onChanged;
+
+  const IosDanmuSettingsSection({
+    super.key,
+    this.initialSettingsOverride,
+    this.onChanged,
+  });
+
+  @override
+  State<IosDanmuSettingsSection> createState() =>
+      _IosDanmuSettingsSectionState();
+}
+
+class _IosDanmuSettingsSectionState extends State<IosDanmuSettingsSection> {
+  DanmuSettings _settings = const DanmuSettings();
+
+  @override
+  void initState() {
+    super.initState();
+    if (OhosRuntime.isOhos) return;
+    if (widget.initialSettingsOverride != null) {
+      _settings = widget.initialSettingsOverride!;
+    } else {
+      unawaited(_load());
+    }
+  }
+
+  Future<void> _load() async {
+    final loaded = await DanmuPrefs.load();
+    if (!mounted) return;
+    setState(() => _settings = loaded);
+  }
+
+  Future<void> _update(DanmuSettings next) async {
+    if (OhosRuntime.isOhos) return;
+    setState(() => _settings = next);
+    await DanmuPrefs.save(next);
+    if (!mounted) return;
+    widget.onChanged?.call();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (OhosRuntime.isOhos) return const SizedBox.shrink();
+    final serverCount = _settings.normalizedOrigins.length;
+    return IosSettingsGroup(
+      header: '分片弹幕',
+      footer: '默认服务地址为空，需自行填写兼容弹幕服务地址后启用拉取。',
+      children: [
+        IosSettingsSwitchRow(
+          key: const ValueKey('ios-switch-danmu-enabled'),
+          icon: CupertinoIcons.chat_bubble_text_fill,
+          iconColor: AppleColors.systemTeal,
+          title: '默认开启弹幕',
+          subtitle: '进入点播播放页时自动开启弹幕叠加层',
+          value: _settings.enabled,
+          onChanged: (v) => unawaited(_update(_settings.copyWith(enabled: v))),
+        ),
+        IosSettingsSwitchRow(
+          key: const ValueKey('ios-switch-danmu-scroll'),
+          icon: CupertinoIcons.arrow_left_right,
+          iconColor: AppleColors.systemBlue,
+          title: '滚动弹幕',
+          value: _settings.showScroll,
+          onChanged: (v) =>
+              unawaited(_update(_settings.copyWith(showScroll: v))),
+        ),
+        IosSettingsSwitchRow(
+          key: const ValueKey('ios-switch-danmu-top'),
+          icon: CupertinoIcons.arrow_up_to_line,
+          iconColor: AppleColors.systemIndigo,
+          title: '顶部固定弹幕',
+          value: _settings.showTop,
+          onChanged: (v) => unawaited(_update(_settings.copyWith(showTop: v))),
+        ),
+        IosSettingsSwitchRow(
+          key: const ValueKey('ios-switch-danmu-bottom'),
+          icon: CupertinoIcons.arrow_down_to_line,
+          iconColor: AppleColors.systemPurple,
+          title: '底部固定弹幕',
+          value: _settings.showBottom,
+          onChanged: (v) =>
+              unawaited(_update(_settings.copyWith(showBottom: v))),
+        ),
+        IosSettingsRow(
+          key: const ValueKey('ios-open-danmu-advanced'),
+          icon: CupertinoIcons.slider_horizontal_3,
+          iconColor: AppleColors.systemOrange,
+          title: '弹幕样式、服务地址与屏蔽词',
+          subtitle: '调节透明度、字号、显示区域、兼容服务源与正则屏蔽词',
+          trailingText: serverCount > 0 ? '$serverCount 个服务源' : '未配置',
+          showChevron: true,
+          onTap: () {
+            unawaited(
+              DanmuSettingsSheet.show(
+                context,
+                initialSettings: _settings,
+                onChanged: (updated) {
+                  if (!mounted) return;
+                  setState(() => _settings = updated);
+                  widget.onChanged?.call();
+                },
+              ),
+            );
+          },
+        ),
+      ],
+    );
+  }
+}
+
+/// Global Player HUD & gesture switches backed by [PlayerHudPrefs] using
+/// [IosSettingsSwitchRow] (`IosNativeSwitch` on iOS). Guarded with `!OhosRuntime.isOhos`.
+class IosPlayerHudSettingsSection extends StatefulWidget {
+  final PlayerHudPrefs? debugHudPrefs;
+  final VoidCallback? onChanged;
+
+  const IosPlayerHudSettingsSection({
+    super.key,
+    this.debugHudPrefs,
+    this.onChanged,
+  });
+
+  @override
+  State<IosPlayerHudSettingsSection> createState() =>
+      _IosPlayerHudSettingsSectionState();
+}
+
+class _IosPlayerHudSettingsSectionState
+    extends State<IosPlayerHudSettingsSection> {
+  late final PlayerHudPrefs _hudPrefs;
+  late final bool _ownsPrefs;
+
+  @override
+  void initState() {
+    super.initState();
+    final isDesktop = !kIsWeb &&
+        (defaultTargetPlatform == TargetPlatform.windows ||
+            defaultTargetPlatform == TargetPlatform.macOS ||
+            defaultTargetPlatform == TargetPlatform.linux);
+    _ownsPrefs = widget.debugHudPrefs == null;
+    _hudPrefs = widget.debugHudPrefs ?? PlayerHudPrefs(isDesktop: isDesktop);
+    _hudPrefs.addListener(_onPrefsChanged);
+    if (!OhosRuntime.isOhos) {
+      unawaited(_hudPrefs.load());
+    }
+  }
+
+  void _onPrefsChanged() {
+    if (mounted) setState(() {});
+    widget.onChanged?.call();
+  }
+
+  @override
+  void dispose() {
+    _hudPrefs.removeListener(_onPrefsChanged);
+    if (_ownsPrefs) {
+      _hudPrefs.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (OhosRuntime.isOhos) return const SizedBox.shrink();
+    final data = _hudPrefs.data;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        IosSettingsGroup(
+          header: '播放界面与 HUD',
+          footer: '仅保存在本机，不影响跨端配置同步。',
+          children: [
+            IosSettingsSwitchRow(
+              key: const ValueKey('ios-switch-hud-start-spec'),
+              icon: CupertinoIcons.sparkles,
+              iconColor: AppleColors.systemBlue,
+              title: '起播规格提示',
+              subtitle: '首帧就绪后展示 4K / HDR / 杜比等媒体规格徽章',
+              value: data.startSpecHud,
+              onChanged: (v) => unawaited(_hudPrefs.setStartSpecHud(v)),
+            ),
+            IosSettingsSwitchRow(
+              key: const ValueKey('ios-switch-hud-slim-progress'),
+              icon: CupertinoIcons.minus_rectangle_fill,
+              iconColor: AppleColors.systemTeal,
+              title: '隐藏控制栏时显示细进度条',
+              subtitle: '点播播放隐藏主控栏后在底部常驻细进度指示条',
+              value: data.slimProgress,
+              onChanged: (v) => unawaited(_hudPrefs.setSlimProgress(v)),
+            ),
+            IosSettingsSwitchRow(
+              key: const ValueKey('ios-switch-hud-skip-countdown'),
+              icon: CupertinoIcons.forward_end_alt_fill,
+              iconColor: AppleColors.systemIndigo,
+              title: '跳过片头/片尾 3 秒倒计时',
+              subtitle: '关闭后达到跳过点将静默立即跳转',
+              value: data.skipCountdown,
+              onChanged: (v) => unawaited(_hudPrefs.setSkipCountdown(v)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 20),
+        SettingsChoices<String>(
+          title: '两侧双击手势',
+          value: data.doubleTapSides,
+          choices: const [
+            ('seek_10s', '快进 / 快退 10 秒（默认）'),
+            ('seek_15s', '快进 / 快退 15 秒'),
+            ('seek_5s', '快进 / 快退 5 秒'),
+            ('play_pause', '全屏双击播放 / 暂停'),
+          ],
+          onSelected: (v) => _hudPrefs.setDoubleTapSides(v),
+        ),
+        SettingsChoices<String>(
+          title: '长按倍速松手恢复',
+          value: data.longPressRestoreMode,
+          choices: const [
+            ('previous', '恢复长按前常驻倍速（默认）'),
+            ('1.0x', '强制恢复 1.0× 原速'),
+          ],
+          onSelected: (v) => _hudPrefs.setLongPressRestoreMode(v),
+        ),
+      ],
+    );
+  }
 }

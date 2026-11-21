@@ -16,11 +16,14 @@ from platform_package_names import ALIASES as CLEAR_NAMES
 
 SUFFIXES = {
     'ios': ('ios-unsigned.ipa',),
+    'appletv': ('appletv-unsigned.ipa',),
+    'harmonyos': ('harmonyos.hap',),
     'windows': ('windows-setup.exe', 'windows-x64.zip'),
     'macos': ('macos.zip',),
 }
 PLATFORM_LABELS = {
     'ios': 'iPhone / iPad', 'windows': 'Windows', 'macos': 'macOS',
+    'appletv': 'Apple TV', 'harmonyos': 'HarmonyOS NEXT',
     'android-tv': 'Android 电视', 'android-mobile': 'Android 手机 / 平板',
     'android-lite': 'Android Lite',
 }
@@ -29,6 +32,7 @@ NOTE_SUFFIXES = {
     'android-lite.apk': 'android-lite',
     'preview.apk': 'android-tv', 'mobile.apk': 'android-mobile',
     'lite.apk': 'android-lite', 'ios-unsigned.ipa': 'ios',
+    'appletv-unsigned.ipa': 'appletv', 'harmonyos.hap': 'harmonyos',
     'windows-setup.exe': 'windows', 'windows-x64.zip': 'windows',
     'macos.zip': 'macos',
 }
@@ -38,7 +42,7 @@ NOTE_SUFFIXES.update({new: NOTE_SUFFIXES[old] for old, new in CLEAR_NAMES.items(
 def note_record(release):
     """Keep the published text verbatim; filenames/tags establish platform scope."""
     tag = release.get('tag_name', '')
-    match = re.fullmatch(r'(?:(ios|windows|macos|android-tv|android-mobile|android-lite)-)?v(\d+\.\d+\.\d+)(-preview)?', tag)
+    match = re.fullmatch(r'(?:(ios|windows|macos|appletv|harmonyos|android-tv|android-mobile|android-lite)-)?v(\d+\.\d+\.\d+)(-preview)?', tag)
     if not match or release.get('draft') or not release.get('published_at'):
         return None
     platform, version, _ = match.groups()
@@ -70,7 +74,7 @@ def release_history(output, releases):
     files = {}
     for item in records:
         # Validate saved names too: an on-disk index never supplies output paths.
-        if not re.fullmatch(r'(?:(?:ios|windows|macos|android-tv|android-mobile|android-lite)-)?v\d+\.\d+\.\d+(?:-preview)?', item['tag']):
+        if not re.fullmatch(r'(?:(?:ios|windows|macos|appletv|harmonyos|android-tv|android-mobile|android-lite)-)?v\d+\.\d+\.\d+(?:-preview)?', item['tag']):
             raise ValueError('Invalid archived release tag')
         text = item['notes'] if item['notes'].strip() else '该历史版本未提供更新说明。'
         files[f'updates/history/{item["tag"]}.md'] = (text + '\n').encode('utf-8')
@@ -448,7 +452,7 @@ def sync(output, releases=None):
     # the complete snapshot; never rewrite a previously published binary.
     for name, body in files.items():
         target = output / name
-        if target.exists() and target.suffix in ('.ipa', '.exe', '.zip', '.apk') and target.read_bytes() != body:
+        if target.exists() and target.suffix in ('.ipa', '.exe', '.zip', '.apk', '.hap') and target.read_bytes() != body:
             raise ValueError('Immutable package differs: ' + name)
     for name, body in files.items():
         target = output / name

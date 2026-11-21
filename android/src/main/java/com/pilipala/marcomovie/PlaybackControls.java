@@ -13,6 +13,10 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
 import android.view.*;
 import android.widget.*;
+import com.pilipala.marcomovie.hud.PlaybackStateProbe;
+import com.pilipala.marcomovie.hud.PlayerHudPrefs;
+import com.pilipala.marcomovie.hud.SkipCountdownPill;
+import com.pilipala.marcomovie.hud.SleepTimerSheet;
 
 import java.util.*;
 
@@ -41,6 +45,16 @@ final class PlaybackControls {
     final PlaybackEffects effects = new PlaybackEffects();
     final DanmakuView danmaku;
     boolean danmakuLoaded;
+    private DanmuSegmentCache danmuSegmentCache;
+    private DanmuProvider.CancellationToken danmuMatchToken;
+    private DanmuProvider.Candidate activeDanmuCandidate;
+    private int danmuSessionSerial;
+    private String activeDanmuServerSignature = "";
+    private String lastObservedDanmuServerSignature = "";
+    private boolean lastDanmuTvSeeking;
+    private boolean lastDanmuPlaying;
+    private float lastDanmuSpeed = 1f;
+    private FirstPlayGestureHint firstPlayGestureHint;
     boolean currentMobileLandscape;
     final Map<String, Button> buttons = new LinkedHashMap<>();
     Button lastFocusedModernButton;
@@ -48,6 +62,224 @@ final class PlaybackControls {
     View menuAnchor;
     String lastSubtitle = "";
     boolean dialogOpen, transitioning;
+    private TvMarkerHost markerState;
+    private final TvMarkerTailGate markerTail = new TvMarkerTailGate();
+    private MoviePlayer markerObservedPlayer;
+
+    // Session-scoped sleep timer (cold-start default OFF; persists across in-place episode
+    // transitions within the same playback session, cleared on exit/destroy/new playback session).
+    static final SleepTimerSheet.Controller SESSION_SLEEP_TIMER = new SleepTimerSheet.Controller();
+    private static boolean preserveSleepTimerForInPlaceSwitch;
+    final SkipCountdownPill skipCountdownPill;
+    final SleepTimerSheet.WarningPill sleepWarningPill;
+    boolean outroSkipCancelledForEpisode;
+    private int pendingIntroSkipMs;
+    private boolean lastControlsVisibleForSkip;
+
+    static void markSleepTimerInPlaceSwitch() {
+        preserveSleepTimerForInPlaceSwitch = true;
+    }
+
+    static void clearSleepTimerOnLeave() {
+        preserveSleepTimerForInPlaceSwitch = false;
+        SESSION_SLEEP_TIMER.cancel();
+    }
+
+    /** Reserved Wave 2 danmu mount hook (null in Wave 1; preserves existing DanmakuView). */
+    Runnable danmuMountHook;
+
+    FrameLayout firstPlayGestureHintSlot() {
+        return a.playerChrome != null ? a.playerChrome.firstPlayGestureHintSlot : null;
+    }
+
+    void setDanmuMountHook(Runnable hook) {
+        danmuMountHook = hook;
+    }
+
+    void updateSafeTop(int safeTopPx) {
+        if (sleepWarningPill != null) {
+            sleepWarningPill.updateSafeTop(safeTopPx);
+        }
+    }
+
+    private void hideSleepWarning() {
+        if (sleepWarningPill == null) return;
+        boolean hadFocus = sleepWarningPill.hasFocus();
+        sleepWarningPill.hide();
+        syncSleepWarningTvFocusLinks(false);
+        if (hadFocus && a.isTvDevice()) {
+            if (a.controlsVisible) {
+                if (modernTv
+                        && lastFocusedModernButton != null
+                        && lastFocusedModernButton.getVisibility() == View.VISIBLE) {
+                    lastFocusedModernButton.requestFocus();
+                } else if (timeline != null) {
+                    timeline.requestFocus();
+                }
+            } else if (a.root != null) {
+                a.root.requestFocus();
+            }
+        }
+    }
+
+    private void syncSleepWarningTvFocusLinks(boolean warningVisible) {
+        if (!a.isTvDevice() || sleepWarningPill == null) return;
+        int warningExtendId = sleepWarningPill.getExtendButtonId();
+        if (modernTv) {
+            for (Button b : buttons.values()) {
+                if (b instanceof ModernIconButton && b.getVisibility() == View.VISIBLE) {
+                    b.setNextFocusUpId(
+                            SleepTimerSheet.resolveActionUpFocusId(
+                                    warningVisible, warningExtendId, b.getId()));
+                }
+            }
+            if (warningVisible) {
+                int downId =
+                        lastFocusedModernButton != null
+                                        && lastFocusedModernButton.getVisibility() == View.VISIBLE
+                                ? lastFocusedModernButton.getId()
+                                : (timeline != null ? timeline.getId() : View.NO_ID);
+                sleepWarningPill.setDownFocusTargetId(downId);
+            }
+        } else if (timeline != null) {
+            timeline.setNextFocusUpId(
+                    SleepTimerSheet.resolveActionUpFocusId(
+                            warningVisible, warningExtendId, View.NO_ID));
+            if (warningVisible) {
+                sleepWarningPill.setDownFocusTargetId(timeline.getId());
+            }
+        }
+    }
+
+    boolean canRunSkipCountdown() {
+        boolean inPip = android.os.Build.VERSION.SDK_INT >= 24 && a.isInPictureInPictureMode();
+        PlaybackStateProbe.Snapshot snap =
+                a.player != null && a.prepared ? PlaybackStateProbe.inspect(a.player) : null;
+        boolean playbackIntended = PlaybackStateProbe.isPlaybackIntended(a.playing, snap);
+        boolean activeDialogShowing = activeDialog != null && activeDialog.isShowing();
+        return PlaybackStateProbe.canRunSkipCountdown(
+                a.foreground,
+                a.miniMode,
+                inPip,
+                a.playerLocked,
+                a.prepared,
+                playbackIntended,
+                transitioning,
+                activeDialogShowing);
+    }
+
+    void syncSkipCountdownLifecycle() {
+        if (skipCountdownPill != null) {
+            skipCountdownPill.syncPlaybackGuard();
+        }
+    }
+
+    private static int findDanmakuOverlayIndex(ViewGroup playbackLayer) {
+        if (playbackLayer == null) return -1;
+        int found = -1;
+        for (int i = 0; i < playbackLayer.getChildCount(); i++) {
+            View child = playbackLayer.getChildAt(i);
+            if (child instanceof DanmakuView || "danmaku-view".equals(child.getTag())) {
+                found = i;
+            }
+        }
+        return found;
+    }
+
+    /**
+     * Enforces strict playback layer Z-order: Video surface (0) -> DanmakuView (1) ->
+     * SubtitleOverlayView (2) -> HUD overlays (3+), ensuring subtitles always render above danmaku.
+     */
+    static void mountMediaOverlaysInZOrder(
+            ViewGroup playbackLayer,
+            View danmakuView,
+            ViewGroup.LayoutParams danmakuLp,
+            View subtitleView,
+            ViewGroup.LayoutParams subtitleLp) {
+        if (playbackLayer == null) return;
+        if (danmakuView != null) {
+            if (danmakuView.getParent() instanceof ViewGroup) {
+                ((ViewGroup) danmakuView.getParent()).removeView(danmakuView);
+            }
+            int danmakuIndex = Math.min(1, playbackLayer.getChildCount());
+            if (danmakuLp != null) {
+                playbackLayer.addView(danmakuView, danmakuIndex, danmakuLp);
+            } else {
+                playbackLayer.addView(danmakuView, danmakuIndex);
+            }
+        }
+        if (subtitleView != null) {
+            if (subtitleView.getParent() instanceof ViewGroup) {
+                ((ViewGroup) subtitleView.getParent()).removeView(subtitleView);
+            }
+            int subtitleIndex;
+            if (danmakuView != null) {
+                int dmIdx = playbackLayer.indexOfChild(danmakuView);
+                subtitleIndex = dmIdx >= 0 ? dmIdx + 1 : Math.min(2, playbackLayer.getChildCount());
+            } else {
+                int existingDmIdx = findDanmakuOverlayIndex(playbackLayer);
+                subtitleIndex =
+                        existingDmIdx >= 0
+                                ? existingDmIdx + 1
+                                : Math.min(1, playbackLayer.getChildCount());
+            }
+            if (subtitleLp != null) {
+                playbackLayer.addView(subtitleView, subtitleIndex, subtitleLp);
+            } else {
+                playbackLayer.addView(subtitleView, subtitleIndex);
+            }
+        }
+    }
+
+    void onScreenLockRequested() {
+        if (skipCountdownPill != null) {
+            skipCountdownPill.dismissSilently();
+        }
+        hideFirstPlayGestureHint();
+    }
+
+    void resetEpisodeTransientState() {
+        outroSkipCancelledForEpisode = false;
+        pendingIntroSkipMs = 0;
+        if (skipCountdownPill != null) skipCountdownPill.dismissSilently();
+        closeSegmentedDanmuSession();
+        danmakuLoaded = false;
+        hideFirstPlayGestureHint();
+    }
+
+    TvMarkerHost markers() {
+        if (markerState == null) markerState = new TvMarkerHost(a, this);
+        return markerState;
+    }
+
+    void resetMarkers() {
+        if (markerState != null) markerState.abort();
+        markerState = null;
+        markerTail.reset();
+    }
+
+    void refreshMarkerPlaybackMode() {
+        if (a.isTvDevice() && a.player != null && a.prepared && !a.isLive() && !a.isCast())
+            a.player.setRepeatOne(
+                    a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1
+                            && outroPosition(a.player.getDuration()) == 0);
+    }
+
+    private int introPosition(int duration) {
+        int legacy = getVideoIntro(a, site, video) * 1000;
+        return a.isTvDevice() && !a.isLive() && !a.isCast()
+                ? (int) Math.min(Integer.MAX_VALUE, markers().effective(true, duration, legacy))
+                : legacy;
+    }
+
+    private long outroPosition(int duration) {
+        int tail = getVideoOutro(a, site, video) * 1000;
+        long legacy = tail > 0 && tail < duration ? duration - tail : 0;
+        return a.isTvDevice() && !a.isLive() && !a.isCast()
+                ? markers().effective(false, a.player == null ? 0 : a.player.getDuration(), legacy)
+                : legacy;
+    }
+
     boolean touchSeeking, sliderSeeking;
     long lastSeekTimeMs;
     int lastSeekTargetMs = -1;
@@ -62,6 +294,149 @@ final class PlaybackControls {
         lastSeekTimeMs = android.os.SystemClock.uptimeMillis();
         lastSeekTargetMs = Math.max(0, targetMs);
         timeline.setProgress(lastSeekTargetMs);
+        onDanmuSeekSettled(lastSeekTargetMs);
+    }
+
+    void onDanmuSeekInitiated() {
+        if (danmaku != null) {
+            danmaku.onSeekInitiated();
+        }
+    }
+
+    void onDanmuSeekSettled(long targetRawPositionMs) {
+        if (danmaku != null) {
+            danmaku.onSeekSettled(Math.max(0L, targetRawPositionMs));
+        }
+    }
+
+    void onDanmuPlaySpeedChanged(float speed) {
+        if (speed <= 0f) return;
+        lastDanmuSpeed = speed;
+        if (danmaku != null) {
+            danmaku.setPlaySpeed(speed);
+        }
+    }
+
+    void syncDanmuPlaybackState() {
+        if (danmaku == null || danmaku.closed) return;
+        reconcileDetachedSegmentedDanmuSession();
+        boolean tvSeeking = a.isTvDevice() && a.seekGesture.active;
+        if (tvSeeking && !lastDanmuTvSeeking) {
+            onDanmuSeekInitiated();
+        } else if (!tvSeeking && lastDanmuTvSeeking) {
+            long pos = a.player != null && a.prepared ? a.player.getCurrentPosition() : 0L;
+            onDanmuSeekSettled(pos);
+        }
+        lastDanmuTvSeeking = tvSeeking;
+
+        if (a.player != null && a.prepared) {
+            float speed = a.player.getSpeed();
+            if (speed > 0f && Math.abs(speed - lastDanmuSpeed) > 0.01f) {
+                onDanmuPlaySpeedChanged(speed);
+            }
+        }
+
+        boolean nowPlaying = a.playing && a.player != null && a.prepared;
+        if (nowPlaying != lastDanmuPlaying) {
+            lastDanmuPlaying = nowPlaying;
+            if (danmaku.enabled) {
+                if (danmuSegmentCache != null
+                        && danmaku.hasSegmentCache()
+                        && a.player != null
+                        && a.prepared) {
+                    danmuSegmentCache.onPlaybackTick(a.player.getCurrentPosition(), nowPlaying);
+                }
+                danmaku.invalidate();
+            }
+        }
+    }
+
+    static boolean shouldCloseDetachedSegmentCache(
+            boolean hasTrackedCache, boolean viewHasSegmentCache) {
+        return hasTrackedCache && !viewHasSegmentCache;
+    }
+
+    private void reconcileDetachedSegmentedDanmuSession() {
+        if (shouldCloseDetachedSegmentCache(
+                danmuSegmentCache != null, danmaku != null && danmaku.hasSegmentCache())) {
+            closeSegmentedDanmuSession();
+        }
+    }
+
+    void closeSegmentedDanmuSession() {
+        danmuSessionSerial++;
+        if (danmuMatchToken != null) {
+            danmuMatchToken.cancel();
+            danmuMatchToken = null;
+        }
+        activeDanmuCandidate = null;
+        activeDanmuServerSignature = "";
+        DanmuSegmentCache cache = danmuSegmentCache;
+        danmuSegmentCache = null;
+        if (danmaku != null) {
+            danmaku.detachSegmentCache();
+        }
+        if (cache != null) {
+            cache.close();
+        }
+    }
+
+    void loadLocalDanmakuText(String text) {
+        closeSegmentedDanmuSession();
+        danmaku.enabled(true);
+        danmaku.loadText(
+                text,
+                new DanmakuView.Listener() {
+                    public void loaded(int count) {
+                        danmakuLoaded = count > 0;
+                        a.toast("已加载 " + count + " 条弹幕");
+                    }
+
+                    public void error(String message) {
+                        a.notice(message);
+                    }
+                });
+    }
+
+    private void maybeShowFirstPlayGestureHint() {
+        if (a.isLive() || a.isCast() || a.miniMode || a.playerLocked || transitioning) return;
+        FrameLayout slot = firstPlayGestureHintSlot();
+        if (slot == null) return;
+        if (firstPlayGestureHint == null) {
+            firstPlayGestureHint = new FirstPlayGestureHint(a);
+            firstPlayGestureHint.setTag("first-play-gesture-hint");
+            FrameLayout.LayoutParams lp =
+                    new FrameLayout.LayoutParams(
+                            FrameLayout.LayoutParams.WRAP_CONTENT,
+                            FrameLayout.LayoutParams.WRAP_CONTENT,
+                            Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+            lp.leftMargin = a.dp(16);
+            lp.rightMargin = a.dp(16);
+            lp.bottomMargin = a.dp(a.isTvDevice() ? 132 : 96);
+            slot.addView(firstPlayGestureHint, lp);
+        }
+        boolean reducedTransparency =
+                a.prefs != null && a.prefs.getBoolean(Prefs.REDUCED_TRANSPARENCY, false);
+        boolean shown =
+                firstPlayGestureHint.showIfEligible(
+                        a.isTvDevice(),
+                        a.reduced,
+                        reducedTransparency,
+                        () -> {
+                            FrameLayout s = firstPlayGestureHintSlot();
+                            if (s != null) s.setVisibility(View.GONE);
+                        });
+        slot.setVisibility(shown ? View.VISIBLE : View.GONE);
+    }
+
+    private void hideFirstPlayGestureHint() {
+        if (firstPlayGestureHint != null) {
+            firstPlayGestureHint.hideImmediate();
+        }
+        FrameLayout slot = firstPlayGestureHintSlot();
+        if (slot != null) {
+            slot.setVisibility(View.GONE);
+        }
     }
 
     int displayPosition(int actualPositionMs) {
@@ -82,6 +457,11 @@ final class PlaybackControls {
             Cms.Video v,
             Cms.Episode ep) {
         a = host;
+        boolean preservedSleep = preserveSleepTimerForInPlaceSwitch;
+        preserveSleepTimerForInPlaceSwitch = false;
+        SESSION_SLEEP_TIMER.onNewPlaybackSession(
+                preservedSleep, android.os.SystemClock.uptimeMillis());
+        lastControlsVisibleForSkip = a.controlsVisible;
         modernTv = a.isTvDevice() && a.prefs.getInt(Prefs.TV_PLAYER_STYLE, 0) == 0;
         site = s;
         video = v;
@@ -90,6 +470,9 @@ final class PlaybackControls {
                 (modernTv && host.playerChrome != null && host.playerChrome.actionHost != null)
                         ? host.playerChrome.actionHost
                         : overlay;
+        if (dockOverlay != null) {
+            dockOverlay.setMotionEventSplittingEnabled(false);
+        }
         surface = texture;
         danmaku =
                 new DanmakuView(
@@ -103,15 +486,133 @@ final class PlaybackControls {
                                 return a.player != null && a.player.isPlaying();
                             }
                         });
-        a.playbackLayer.addView(danmaku, 1, new FrameLayout.LayoutParams(-1, -1));
-        danmaku.enabled(false);
+        danmaku.setTag("danmaku-view");
         subtitle = new SubtitleOverlayView(a);
         subtitle.setUserDefaultStyle();
         subtitle.setPadding(a.dp(40), 0, a.dp(40), a.dp(12));
         FrameLayout.LayoutParams caption = new FrameLayout.LayoutParams(-1, -1, Gravity.BOTTOM);
         caption.bottomMargin = a.dp(168);
-        a.playbackLayer.addView(subtitle, 1, caption);
+        mountMediaOverlaysInZOrder(
+                a.playbackLayer, danmaku, new FrameLayout.LayoutParams(-1, -1), subtitle, caption);
+        DanmuSettingsPanel.DanmuConfig initialDanmuCfg =
+                DanmuSettingsPanel.loadConfig(a, a.isTvDevice());
+        lastObservedDanmuServerSignature = danmuServerSignature(initialDanmuCfg);
+        danmaku.applyConfig(initialDanmuCfg);
         applySubtitleStyle();
+        boolean reducedTransparency =
+                a.prefs != null && a.prefs.getBoolean(Prefs.REDUCED_TRANSPARENCY, false);
+        skipCountdownPill = new SkipCountdownPill(a, a.isTvDevice());
+        skipCountdownPill.setReducedTransparency(reducedTransparency);
+        skipCountdownPill.setPlaybackGuard(this::canRunSkipCountdown);
+        skipCountdownPill.setTouchInteractionHook(
+                () -> {
+                    if (a.touchPlayerGesture != null) a.touchPlayerGesture.cancelActiveGesture();
+                });
+        skipCountdownPill.setSilentDismissListener(
+                wasIntro -> {
+                    if (!wasIntro && !outroSkipCancelledForEpisode) {
+                        // Allow TV outro skip to cleanly re-evaluate when foreground playback
+                        // resumes after pause/call/background without marking user-cancelled.
+                        markerTail.reset();
+                    }
+                });
+        skipCountdownPill.setCallbacks(
+                new SkipCountdownPill.Callbacks() {
+                    @Override
+                    public void onSkipExecute(boolean intro, int targetPositionMs) {
+                        if (intro) pendingIntroSkipMs = 0;
+                        executeSkipAction(intro, targetPositionMs);
+                    }
+
+                    @Override
+                    public void onCancelled(boolean intro) {
+                        if (intro) {
+                            pendingIntroSkipMs = 0;
+                        } else {
+                            outroSkipCancelledForEpisode = true;
+                        }
+                    }
+
+                    @Override
+                    public void onTvDialogStateChanged(boolean open) {
+                        if (open) {
+                            dialogOpen = true;
+                        } else if (activeDialog == null || !activeDialog.isShowing()) {
+                            dialogOpen = false;
+                            if (a.isTvDevice()) {
+                                View curFocus = a.getCurrentFocus();
+                                boolean focusStillOnSkip =
+                                        curFocus == null
+                                                || curFocus == skipCountdownPill
+                                                || (curFocus.getParent() != null
+                                                        && curFocus.getParent().getParent()
+                                                                == skipCountdownPill);
+                                if (focusStillOnSkip) {
+                                    if (a.controlsVisible) {
+                                        if (timeline != null) timeline.requestFocus();
+                                    } else if (a.root != null) {
+                                        a.root.requestFocus();
+                                    }
+                                }
+                                if (a.controlsVisible && a.playing) {
+                                    a.scheduleHide();
+                                }
+                            }
+                        }
+                    }
+
+                    @Override
+                    public void onTvMediaKey(int keyCode) {
+                        if (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
+                                || (keyCode == KeyEvent.KEYCODE_MEDIA_PLAY && !a.playing)
+                                || (keyCode == KeyEvent.KEYCODE_MEDIA_PAUSE && a.playing)) {
+                            a.togglePlayback();
+                        }
+                        a.showControls(true);
+                    }
+
+                    @Override
+                    public void onTvMenuKey() {
+                        a.showControls(true);
+                        focusPrimaryAction();
+                    }
+                });
+        FrameLayout.LayoutParams skipLp =
+                new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.RIGHT);
+        skipLp.rightMargin = a.dp(a.isTvDevice() ? 36 : 20);
+        skipLp.bottomMargin = a.dp(a.isTvDevice() ? 96 : 84);
+        a.playbackLayer.addView(skipCountdownPill, skipLp);
+
+        sleepWarningPill =
+                new SleepTimerSheet.WarningPill(
+                        a,
+                        a.isTvDevice(),
+                        () -> {
+                            SESSION_SLEEP_TIMER.extend15Minutes(
+                                    android.os.SystemClock.uptimeMillis());
+                            hideSleepWarning();
+                            a.toast("定时关闭已延长 15 分钟");
+                        },
+                        () -> {
+                            SESSION_SLEEP_TIMER.cancel();
+                            hideSleepWarning();
+                            a.toast("已取消定时关闭");
+                        });
+        sleepWarningPill.setReducedTransparency(reducedTransparency);
+        sleepWarningPill.setTouchInteractionHook(
+                () -> {
+                    if (a.touchPlayerGesture != null) a.touchPlayerGesture.cancelActiveGesture();
+                });
+        FrameLayout.LayoutParams sleepLp =
+                new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        int initialSafeTop = a.playerChrome != null ? a.playerChrome.windowInsets.top : 0;
+        sleepLp.topMargin =
+                SleepTimerSheet.computeWarningTopMarginPx(
+                        a.isTvDevice(),
+                        initialSafeTop,
+                        a.getResources().getDisplayMetrics().density);
+        a.playbackLayer.addView(sleepWarningPill, sleepLp);
+
         timeline = new SeekBar(a);
         timeline.setTag("timeline");
         timeline.setBackgroundColor(Color.TRANSPARENT);
@@ -149,7 +650,11 @@ final class PlaybackControls {
         timeline.setOnSeekBarChangeListener(
                 new SeekBar.OnSeekBarChangeListener() {
                     public void onStartTrackingTouch(SeekBar b) {
+                        if (a.touchPlayerGesture != null) {
+                            a.touchPlayerGesture.cancelActiveGesture();
+                        }
                         sliderSeeking = true;
+                        onDanmuSeekInitiated();
                         a.finishSeek(false);
                         a.scheduleHide();
                     }
@@ -168,6 +673,11 @@ final class PlaybackControls {
                                                 + PlaybackController.formatTime(
                                                         a.player.getDuration()));
                             }
+                        } else if (wasDragging) {
+                            onDanmuSeekSettled(
+                                    a.player != null && a.prepared
+                                            ? a.player.getCurrentPosition()
+                                            : 0L);
                         }
                         a.scheduleHide();
                     }
@@ -274,7 +784,17 @@ final class PlaybackControls {
             registerHiddenAction("aspect", this::aspect);
             registerHiddenAction("subtitles", () -> tracks(3));
         } else {
-            add(row, "锁定", "lock-tool", () -> PlaybackController.setPlayerLocked(a, true));
+            add(
+                    row,
+                    "锁定",
+                    "lock-tool",
+                    () -> {
+                        if (a.touchPlayerGesture != null) {
+                            a.touchPlayerGesture.onScreenLockRequested();
+                        }
+                        onScreenLockRequested();
+                        PlaybackController.setPlayerLocked(a, true);
+                    });
             add(
                     row,
                     live ? "上台" : "上集",
@@ -489,13 +1009,18 @@ final class PlaybackControls {
             }
         }
         if (vis.isEmpty()) return;
+        boolean sleepVisible = sleepWarningPill != null && sleepWarningPill.isShowing();
+        int sleepExtendId =
+                sleepWarningPill != null ? sleepWarningPill.getExtendButtonId() : View.NO_ID;
         for (int i = 0; i < vis.size(); i++) {
             final Button cur = vis.get(i);
             final Button prev = vis.get((i - 1 + vis.size()) % vis.size());
             final Button nxt = vis.get((i + 1) % vis.size());
             cur.setNextFocusLeftId(prev.getId());
             cur.setNextFocusRightId(nxt.getId());
-            cur.setNextFocusUpId(cur.getId());
+            cur.setNextFocusUpId(
+                    SleepTimerSheet.resolveActionUpFocusId(
+                            sleepVisible, sleepExtendId, cur.getId()));
             cur.setNextFocusDownId(live ? cur.getId() : timeline.getId());
             final boolean isFirst = i == 0;
             final boolean isLast = i == vis.size() - 1;
@@ -540,6 +1065,7 @@ final class PlaybackControls {
         }
         if (!tv) {
             LinearLayout col = a.vertical();
+            col.setMotionEventSplittingEnabled(false);
             col.setGravity(Gravity.CENTER_HORIZONTAL);
             col.setClipChildren(false);
             col.setClipToPadding(false);
@@ -686,6 +1212,9 @@ final class PlaybackControls {
         a.pressFeedback(b);
         b.setOnClickListener(
                 v -> {
+                    if (a.touchPlayerGesture != null) {
+                        a.touchPlayerGesture.cancelActiveGesture();
+                    }
                     menuAnchor = buttons.get(key);
                     action.run();
                 });
@@ -849,7 +1378,7 @@ final class PlaybackControls {
                     }
                 case ICON_SKIP_INTRO:
                     {
-                        boolean active = getVideoIntro(a, site, video) > 0;
+                        boolean active = !a.isTvDevice() && getVideoIntro(a, site, video) > 0;
                         float sw = Math.max(1.75f, r * .092f);
                         p.setStyle(Paint.Style.STROKE);
                         p.setStrokeWidth(sw);
@@ -873,7 +1402,7 @@ final class PlaybackControls {
                     }
                 case ICON_SKIP_OUTRO:
                     {
-                        boolean active = getVideoOutro(a, site, video) > 0;
+                        boolean active = !a.isTvDevice() && getVideoOutro(a, site, video) > 0;
                         float sw = Math.max(1.75f, r * .092f);
                         p.setStyle(Paint.Style.STROKE);
                         p.setStrokeWidth(sw);
@@ -915,6 +1444,9 @@ final class PlaybackControls {
                         title,
                         key,
                         () -> {
+                            if (a.touchPlayerGesture != null) {
+                                a.touchPlayerGesture.cancelActiveGesture();
+                            }
                             menuAnchor = buttons.get(key);
                             action.run();
                         });
@@ -978,6 +1510,12 @@ final class PlaybackControls {
             activeDialog.dismiss();
             activeDialog = null;
         }
+        if (skipCountdownPill != null) {
+            skipCountdownPill.dismissSilently();
+        }
+        if (a.touchPlayerGesture != null) {
+            a.touchPlayerGesture.onDialogOpened();
+        }
         if (menuAnchor == null || !UiCompat.isAttached(menuAnchor))
             menuAnchor = buttons.get("more");
         dialogOpen = true;
@@ -1020,7 +1558,10 @@ final class PlaybackControls {
                     line.name + " · 选集",
                     labels,
                     current,
-                    i -> a.changeEpisode(site, video, line, line.episodes.get(i), 0));
+                    i -> {
+                        markSleepTimerInPlaceSwitch();
+                        a.changeEpisode(site, video, line, line.episodes.get(i), 0);
+                    });
             return;
         }
         int page = EpisodeSelection.pageFor(Math.max(0, current), total, false);
@@ -1053,6 +1594,7 @@ final class PlaybackControls {
                     } else {
                         int target = start + (i - 1);
                         if (target >= 0 && target < total) {
+                            markSleepTimerInPlaceSwitch();
                             a.changeEpisode(site, video, line, line.episodes.get(target), 0);
                         }
                     }
@@ -1077,25 +1619,50 @@ final class PlaybackControls {
                         ? resolved.media.optJSONArray("qualities")
                         : null;
         int qCount = qualities != null && qualities.length() > 1 ? qualities.length() : 0;
+        List<String> videoTracks =
+                (a.player != null && a.prepared)
+                        ? a.player.trackLabels(2)
+                        : Collections.emptyList();
+        int vTrackMenuCount = videoTracks.size() > 1 ? videoTracks.size() + 1 : 0;
+        boolean isLiveMode = "live".equals(site.key);
         boolean canCrossSearch =
                 video != null
                         && video.title != null
                         && !video.title.trim().isEmpty()
-                        && !"live".equals(site.key);
-        if (video.lines.isEmpty() && qCount == 0 && !canCrossSearch) {
+                        && !isLiveMode;
+        boolean canEpg = isLiveMode && a.liveSession != null && a.liveSession.index >= 0;
+        if (video.lines.isEmpty()
+                && qCount == 0
+                && vTrackMenuCount == 0
+                && !canCrossSearch
+                && !canEpg) {
             message("此内容只有当前地址。");
             return;
         }
         List<String> items = new ArrayList<>();
+        final int epgIndex = canEpg ? items.size() : -1;
+        if (canEpg) {
+            items.add("📅 节目单与回看 (EPG)");
+        }
+        final int vTrackStart = items.size();
+        if (vTrackMenuCount > 0) {
+            items.add("视频子轨 · 自动优选画质");
+            for (String vt : videoTracks) {
+                items.add("视频子轨 · " + vt);
+            }
+        }
+        final int qStart = items.size();
         int currentQualityIdx =
                 resolved != null && resolved.media != null
                         ? resolved.media.optInt("_qualityIdx", 0)
                         : 0;
+        String qPrefix = isLiveMode ? "直播源 · " : "画质 · ";
         for (int q = 0; q < qCount; q++) {
             org.json.JSONObject qObj = qualities.optJSONObject(q);
-            String qName = qObj != null ? qObj.optString("name", "画质 " + (q + 1)) : "画质 " + (q + 1);
-            items.add("画质 · " + qName + (q == currentQualityIdx ? "（当前）" : ""));
+            String qName = qObj != null ? qObj.optString("name", "线路 " + (q + 1)) : "线路 " + (q + 1);
+            items.add(qPrefix + qName + (q == currentQualityIdx ? "（当前）" : ""));
         }
+        final int lineStart = items.size();
         for (int i = 0; i < video.lines.size(); i++) {
             items.add((qCount > 0 ? "线路 · " : "") + video.lines.get(i).name);
         }
@@ -1103,43 +1670,71 @@ final class PlaybackControls {
         if (canCrossSearch) {
             items.add("搜索同名其他片源 · " + video.title);
         }
-        int selected = qCount > 0 ? currentQualityIdx : lineIndex();
+        int selected =
+                qCount > 0
+                        ? (qStart + currentQualityIdx)
+                        : (vTrackMenuCount > 0 ? vTrackStart : (canEpg ? 0 : lineIndex()));
+        final int finalVTrackMenuCount = vTrackMenuCount;
         final int finalQCount = qCount;
         final org.json.JSONArray finalQualities = qualities;
         choose(
-                qCount > 0 ? "选择画质或播放线路" : "换源 · 选择线路或片源",
+                qCount > 0 || vTrackMenuCount > 0 || canEpg ? "选择画质、线路或节目单" : "换源 · 选择线路或片源",
                 items.toArray(new String[0]),
                 selected,
                 i -> {
+                    if (epgIndex >= 0 && i == epgIndex) {
+                        LiveController.showEpgAndCatchupDialog(a);
+                        return;
+                    }
                     if (crossSearchIndex >= 0 && i == crossSearchIndex) {
+                        clearSleepTimerOnLeave();
                         a.leavePlayback();
                         a.crossSearch(Cms.searchTitle(video));
                         return;
                     }
-                    if (i < finalQCount && finalQualities != null) {
-                        org.json.JSONObject qObj = finalQualities.optJSONObject(i);
+                    if (finalVTrackMenuCount > 0
+                            && i >= vTrackStart
+                            && i < vTrackStart + finalVTrackMenuCount) {
+                        int vtChoice = i - vTrackStart;
+                        if (a.player != null && a.prepared) {
+                            a.player.selectTrack(2, vtChoice == 0 ? -1 : vtChoice - 1);
+                            a.toast(vtChoice == 0 ? "已切换为自动优选画质" : "已锁定所选视频画质轨道");
+                        }
+                        return;
+                    }
+                    int qChoice = i - qStart;
+                    if (qChoice >= 0 && qChoice < finalQCount && finalQualities != null) {
+                        org.json.JSONObject qObj = finalQualities.optJSONObject(qChoice);
                         if (qObj != null) {
                             String nextUrl = qObj.optString("url", "");
                             if (!nextUrl.isEmpty()) {
                                 try {
-                                    resolved.media.put("_qualityIdx", i);
+                                    resolved.media.put("_qualityIdx", qChoice);
                                 } catch (Exception ignored) {
                                 }
-                                resolved.url = LocalProxy.rewrite(nextUrl);
+                                PlaybackController.applyCandidateHeaders(site, resolved, qObj);
                                 a.resumeAt =
-                                        a.prepared && a.player != null
+                                        !isLiveMode && a.prepared && a.player != null
                                                 ? a.player.getCurrentPosition()
                                                 : 0;
-                                a.playerPage(site, video, resolved);
+                                markSleepTimerInPlaceSwitch();
+                                if (LiveQualityPolicy.isEmbyLiveUrl(nextUrl)) {
+                                    LiveController.playEmbyLiveAsync(
+                                            a, site, video, resolved, nextUrl);
+                                } else {
+                                    resolved.url = LocalProxy.rewrite(nextUrl);
+                                    a.playerPage(site, video, resolved);
+                                }
                             }
                         }
                         return;
                     }
-                    int lineIdx = i - finalQCount;
+                    int lineIdx = i - lineStart;
                     if (lineIdx >= 0 && lineIdx < video.lines.size()) {
                         Cms.Line line = video.lines.get(lineIdx);
                         if (!line.episodes.isEmpty()) {
                             int n = Math.min(Math.max(0, episodeIndex()), line.episodes.size() - 1);
+                            markSleepTimerInPlaceSwitch();
                             a.changeEpisode(site, video, line, line.episodes.get(n), 0);
                         }
                     }
@@ -1155,6 +1750,9 @@ final class PlaybackControls {
             next = (next + line.episodes.size()) % line.episodes.size();
         if (next < 0 || next >= line.episodes.size()) return false;
         transitioning = true;
+        resetEpisodeTransientState();
+        markSleepTimerInPlaceSwitch();
+        if (a.touchPlayerGesture != null) a.touchPlayerGesture.onEpisodeSwitch();
         a.changeEpisode(site, video, line, line.episodes.get(next), 0);
         return true;
     }
@@ -1162,6 +1760,7 @@ final class PlaybackControls {
     void reload(boolean preserve) {
         int position =
                 preserve && a.prepared && a.player != null ? a.player.getCurrentPosition() : 0;
+        markSleepTimerInPlaceSwitch();
         if (a.activeLine != null && a.activeEpisode != null)
             a.changeEpisode(site, video, a.activeLine, a.activeEpisode, position);
         else {
@@ -1182,7 +1781,11 @@ final class PlaybackControls {
                 current,
                 i -> {
                     if (a.player != null) a.player.setSpeed(speeds[i]);
+                    onDanmuPlaySpeedChanged(speeds[i]);
                     a.prefs.edit().putFloat(Prefs.PLAY_SPEED, speeds[i]).apply();
+                    if (a.touchPlayerGesture != null) {
+                        a.touchPlayerGesture.onManualSpeedChanged();
+                    }
                     updateLabels();
                 });
     }
@@ -1277,17 +1880,235 @@ final class PlaybackControls {
                 });
     }
 
+    private DanmuProvider.MatchQuery buildDanmuMatchQuery() {
+        String title = video != null && video.title != null ? video.title.trim() : "";
+        Cms.Episode ep = a.activeEpisode != null ? a.activeEpisode : resolved;
+        String epTitle = ep != null && ep.name != null ? ep.name.trim() : "";
+        int epNum = Math.max(1, episodeIndex() + 1);
+        long durSec =
+                (a.player != null && a.prepared && a.player.getDuration() > 0)
+                        ? (a.player.getDuration() / 1000L)
+                        : 0L;
+        return new DanmuProvider.MatchQuery(title, epTitle, epNum, durSec);
+    }
+
+    static String danmuServerSignature(DanmuSettingsPanel.DanmuConfig cfg) {
+        if (cfg == null) return "";
+        return cfg.serverUrls + "|" + cfg.appId + "|" + cfg.appSecret;
+    }
+
+    static boolean shouldApplyAsyncMatchResult(
+            DanmuSettingsPanel.DanmuConfig requestCfg, DanmuSettingsPanel.DanmuConfig latestCfg) {
+        if (requestCfg == null || latestCfg == null || !latestCfg.enabled) {
+            return false;
+        }
+        return danmuServerSignature(requestCfg).equals(danmuServerSignature(latestCfg));
+    }
+
+    static boolean shouldStartSegmentedSessionOnConfigUpdate(
+            boolean enabled,
+            String serverUrls,
+            boolean hasActiveSegmentedSession,
+            boolean hasLegacyLoadedDanmaku,
+            String previousServerSignature,
+            String nextServerSignature) {
+        if (!enabled || serverUrls == null || serverUrls.trim().isEmpty()) {
+            return false;
+        }
+        String prev = previousServerSignature == null ? "" : previousServerSignature;
+        String next = nextServerSignature == null ? "" : nextServerSignature;
+        boolean serverChanged = !prev.equals(next);
+        if (hasLegacyLoadedDanmaku) {
+            return serverChanged;
+        }
+        return !hasActiveSegmentedSession || serverChanged;
+    }
+
+    private void startSegmentedDanmuSession(
+            final DanmuSettingsPanel.DanmuConfig cfg, final boolean showFeedback) {
+        closeSegmentedDanmuSession();
+        if (cfg == null || !cfg.enabled) {
+            danmaku.enabled(false);
+            return;
+        }
+        danmaku.applyConfig(cfg);
+        final DandanplayProvider provider = cfg.createProvider();
+        if (provider.getConfiguredOrigins().isEmpty()) {
+            if (showFeedback) {
+                a.toast("未配置自定义弹幕服务源，请在弹幕设置中填写服务地址或导入本地文件");
+            }
+            return;
+        }
+        final int serial = ++danmuSessionSerial;
+        final DanmuProvider.CancellationToken token = new DanmuProvider.CancellationToken();
+        danmuMatchToken = token;
+        String sig = danmuServerSignature(cfg);
+        activeDanmuServerSignature = sig;
+        lastObservedDanmuServerSignature = sig;
+        final DanmuProvider.MatchQuery query = buildDanmuMatchQuery();
+        a.worker.execute(
+                () -> {
+                    try {
+                        List<DanmuProvider.Candidate> candidates =
+                                provider.matchOrSearch(query, token);
+                        final DanmuProvider.Candidate best =
+                                (candidates != null && !candidates.isEmpty())
+                                        ? candidates.get(0)
+                                        : null;
+                        a.ui.post(
+                                () -> {
+                                    if (token.isCancelled()
+                                            || serial != danmuSessionSerial
+                                            || a.playbackControls != PlaybackControls.this
+                                            || danmaku.closed) {
+                                        return;
+                                    }
+                                    danmuMatchToken = null;
+                                    DanmuSettingsPanel.DanmuConfig latestCfg =
+                                            DanmuSettingsPanel.loadConfig(a, a.isTvDevice());
+                                    if (!shouldApplyAsyncMatchResult(cfg, latestCfg)) {
+                                        return;
+                                    }
+                                    if (best == null
+                                            || best.boundEpisodeId == null
+                                            || best.boundEpisodeId.isEmpty()) {
+                                        if (showFeedback) {
+                                            a.toast("未匹配到弹幕剧集，可调整自定义服务源或导入本地文件");
+                                        }
+                                        return;
+                                    }
+                                    DanmuSegmentCache cache = new DanmuSegmentCache(provider);
+                                    danmuSegmentCache = cache;
+                                    danmakuLoaded = false;
+                                    activeDanmuCandidate = best;
+                                    danmaku.applyConfig(latestCfg);
+                                    danmaku.attachSegmentCache(cache);
+                                    danmaku.enabled(true);
+                                    cache.bindSession(best.boundEpisodeId);
+                                    if (a.player != null && a.prepared) {
+                                        danmaku.setPlaySpeed(a.player.getSpeed());
+                                        cache.onPlaybackTick(
+                                                a.player.getCurrentPosition(),
+                                                a.player.isPlaying());
+                                    }
+                                    if (showFeedback) {
+                                        String label =
+                                                best.animeTitle
+                                                        + (best.episodeTitle.isEmpty()
+                                                                ? ""
+                                                                : " · " + best.episodeTitle);
+                                        a.toast("已匹配分片弹幕：" + label);
+                                    }
+                                });
+                    } catch (DanmuProvider.CancelledException ignored) {
+                    } catch (Exception error) {
+                        AppLog.w("PlaybackControls", "Segmented danmu match failed", error);
+                        if (showFeedback) {
+                            a.ui.post(
+                                    () -> {
+                                        if (!token.isCancelled()
+                                                && serial == danmuSessionSerial
+                                                && a.playbackControls == PlaybackControls.this) {
+                                            a.toast("弹幕服务连接失败，请检查自定义服务地址");
+                                        }
+                                    });
+                        }
+                    }
+                });
+    }
+
+    private void onDanmuConfigUpdated(DanmuSettingsPanel.DanmuConfig config) {
+        if (config == null || danmaku.closed) return;
+        danmaku.applyConfig(config);
+        String prevSig = lastObservedDanmuServerSignature;
+        String nextSig = danmuServerSignature(config);
+        lastObservedDanmuServerSignature = nextSig;
+        if (!config.enabled) {
+            closeSegmentedDanmuSession();
+            return;
+        }
+        if (a.isLive() || a.isCast()) return;
+        if (config.serverUrls.isEmpty()) {
+            if (danmuSegmentCache != null) {
+                closeSegmentedDanmuSession();
+            }
+            return;
+        }
+        if (shouldStartSegmentedSessionOnConfigUpdate(
+                config.enabled,
+                config.serverUrls,
+                danmuSegmentCache != null || danmuMatchToken != null,
+                danmakuLoaded,
+                prevSig,
+                nextSig)) {
+            startSegmentedDanmuSession(config, false);
+        }
+    }
+
+    void openDanmuSettingsPanel() {
+        if (activeDialog != null) {
+            activeDialog.dismiss();
+            activeDialog = null;
+        }
+        if (skipCountdownPill != null) {
+            skipCountdownPill.dismissSilently();
+        }
+        if (a.touchPlayerGesture != null) {
+            a.touchPlayerGesture.onDialogOpened();
+        }
+        lastObservedDanmuServerSignature =
+                danmuServerSignature(DanmuSettingsPanel.loadConfig(a, a.isTvDevice()));
+        dialogOpen = true;
+        if (a.hideControls != null) a.ui.removeCallbacks(a.hideControls);
+        final Dialog[] holder = new Dialog[1];
+        android.app.AlertDialog dlg =
+                DanmuSettingsPanel.showDialog(a, a.isTvDevice(), this::onDanmuConfigUpdated);
+        holder[0] = dlg;
+        dlg.setOnDismissListener(
+                d -> {
+                    if (activeDialog == holder[0]) {
+                        activeDialog = null;
+                        dialogOpen = false;
+                        if (!a.isFinishing()
+                                && (android.os.Build.VERSION.SDK_INT < 17 || !a.isDestroyed())) {
+                            a.scheduleHide();
+                            if (a.isTvDevice() && a.controlsVisible) {
+                                if (modernTv
+                                        && lastFocusedModernButton != null
+                                        && lastFocusedModernButton.getVisibility()
+                                                == View.VISIBLE) {
+                                    lastFocusedModernButton.requestFocus();
+                                } else if (timeline != null) {
+                                    timeline.requestFocus();
+                                }
+                            }
+                        }
+                    }
+                });
+        activeDialog = dlg;
+    }
+
     void danmaku() {
         choose(
                 "弹幕",
-                new String[] {"开启 / 重新加载来源弹幕", "关闭弹幕", "导入本地弹幕 XML / JSON"},
+                new String[] {"弹幕外观与自定义服务设置", "开启 / 重新加载弹幕", "关闭弹幕", "导入本地弹幕 XML / JSON"},
                 -1,
                 i -> {
-                    if (i == 1) {
-                        danmaku.enabled(false);
+                    if (i == 0) {
+                        openDanmuSettingsPanel();
                         return;
                     }
                     if (i == 2) {
+                        closeSegmentedDanmuSession();
+                        danmaku.enabled(false);
+                        DanmuSettingsPanel.DanmuConfig cur =
+                                DanmuSettingsPanel.loadConfig(a, a.isTvDevice());
+                        DanmuSettingsPanel.DanmuConfig.Builder b = cur.toBuilder();
+                        b.enabled = false;
+                        DanmuSettingsPanel.saveConfig(a, b.build());
+                        return;
+                    }
+                    if (i == 3) {
                         a.pickDanmaku();
                         return;
                     }
@@ -1302,23 +2123,36 @@ final class PlaybackControls {
                             }
                         }
                     }
-                    if (address.isEmpty()) {
-                        message("当前来源没有提供弹幕，可导入本地 XML / JSON。");
+                    if (!address.isEmpty()) {
+                        closeSegmentedDanmuSession();
+                        danmaku.enabled(true);
+                        danmaku.load(
+                                address,
+                                resolved.headers,
+                                new DanmakuView.Listener() {
+                                    public void loaded(int count) {
+                                        danmakuLoaded = count > 0;
+                                        a.toast("已加载 " + count + " 条弹幕");
+                                    }
+
+                                    public void error(String message) {
+                                        message(message);
+                                    }
+                                });
                         return;
                     }
-                    danmaku.enabled(true);
-                    danmaku.load(
-                            address,
-                            resolved.headers,
-                            new DanmakuView.Listener() {
-                                public void loaded(int count) {
-                                    a.toast("已加载 " + count + " 条弹幕");
-                                }
-
-                                public void error(String message) {
-                                    message(message);
-                                }
-                            });
+                    DanmuSettingsPanel.DanmuConfig cur =
+                            DanmuSettingsPanel.loadConfig(a, a.isTvDevice());
+                    DanmuSettingsPanel.DanmuConfig.Builder b = cur.toBuilder();
+                    b.enabled = true;
+                    DanmuSettingsPanel.DanmuConfig enabledCfg = b.build();
+                    DanmuSettingsPanel.saveConfig(a, enabledCfg);
+                    if (!enabledCfg.serverUrls.isEmpty()) {
+                        startSegmentedDanmuSession(enabledCfg, true);
+                    } else {
+                        openDanmuSettingsPanel();
+                        a.toast("请先填写自定义弹幕服务地址，或导入本地 XML / JSON");
+                    }
                 });
     }
 
@@ -1354,12 +2188,37 @@ final class PlaybackControls {
     }
 
     void close() {
+        if (markerObservedPlayer != null) markerObservedPlayer.setOnSeekPositionListener(null);
+        markerObservedPlayer = null;
+        resetMarkers(); // Drop unidentified-media session markers with their owning player
+        // controls.
         surface.setFrameAdvancing(false);
         if (activeDialog != null) {
             activeDialog.dismiss();
             activeDialog = null;
         }
+        if (skipCountdownPill != null) skipCountdownPill.dismissSilently();
+        hideSleepWarning();
+        boolean preserveSleep =
+                preserveSleepTimerForInPlaceSwitch
+                        && !a.isFinishing()
+                        && (android.os.Build.VERSION.SDK_INT < 17 || !a.isDestroyed());
+        SESSION_SLEEP_TIMER.onPlayerSessionClosed(preserveSleep);
+        if (preserveSleep && a.ui != null) {
+            // If an in-place switch was aborted or left playback before constructing a replacement
+            // PlaybackControls, clear the sleep timer on the very next UI frame.
+            a.ui.post(
+                    () -> {
+                        if (a.playbackControls == null || a.current == null || !a.current.player) {
+                            clearSleepTimerOnLeave();
+                        }
+                    });
+        } else {
+            preserveSleepTimerForInPlaceSwitch = false;
+        }
         effects.close();
+        closeSegmentedDanmuSession();
+        hideFirstPlayGestureHint();
         danmaku.close();
     }
 
@@ -1378,6 +2237,9 @@ final class PlaybackControls {
         subtitle.setSubtitleSizeValue(size);
         subtitle.setSubtitleBottomDp(bottomDp);
         subtitle.setHorizontalOffsetPercent(offsetX);
+        if (danmaku != null) {
+            danmaku.setSubtitleBottomClearanceDp(bottomDp + 28f);
+        }
         visible(a.controlsVisible);
     }
 
@@ -2385,6 +3247,10 @@ final class PlaybackControls {
     static void setVideoSkip(
             MainActivity a, Cms.Site site, Cms.Video video, boolean intro, int seconds) {
         if (a == null) return;
+        if (a.isTvDevice() && !a.privateMode && VideoMarkerRepository.clearing()) {
+            a.toast("正在保存清除结果，请稍候");
+            return;
+        }
         String siteKey = site == null ? "" : site.key;
         String videoId = VideoSkipStore.videoKeyFrom(video, a.activeEpisode);
         if (a.privateMode) {
@@ -2410,18 +3276,78 @@ final class PlaybackControls {
         return VideoSkipStore.countRecords(a.prefs.getString(Prefs.VIDEO_SKIP_RECORDS, "[]"));
     }
 
-    static void clearVideoSkipRecords(MainActivity a) {
-        if (a == null) return;
-        if (a.privateMode) {
-            VideoSkipStore.clearPrivateRecords();
+    static void clearVideoSkipRecords(MainActivity a, Runnable onChanged) {
+        if (a == null || a.switchingPrivacy || a.isDestroyed()) return;
+        if (!a.isTvDevice()) {
+            if (a.privateMode) VideoSkipStore.clearPrivateRecords();
+            else if (a.prefs != null) a.prefs.edit().remove(Prefs.VIDEO_SKIP_RECORDS).apply();
+            else return;
+            a.toast("已清除全部影片的片头片尾记录");
+            if (onChanged != null) onChanged.run();
             return;
         }
-        if (a.prefs != null) {
-            a.prefs.edit().remove(Prefs.VIDEO_SKIP_RECORDS).apply();
+        if (VideoMarkerRepository.clearing()) {
+            a.toast("正在保存清除结果，请稍候");
+            return;
+        }
+        if (a.markerHost != null) a.markerHost.abort();
+        if (a.playbackControls != null) a.playbackControls.resetMarkers();
+        if (a.privateMode) {
+            VideoMarkerRepository.clearPrivate();
+            VideoSkipStore.clearPrivateRecords();
+            a.toast("已清除当前空间的片头片尾记录");
+            if (onChanged != null) onChanged.run();
+            return;
+        }
+        final android.content.SharedPreferences capturedPrefs = a.prefs;
+        if (capturedPrefs == null) return;
+        final int generation = a.generation;
+        final TvSearchContext context = new TvSearchContext(a.config, a.privateMode, a.engineEpoch);
+        final MarkerClearTask.Write clear =
+                VideoMarkerRepository.preparePublicClear(a.getFilesDir());
+        if (clear == null) return;
+        a.toast("正在清除当前空间的记录");
+        try {
+            MarkerClearTask.submit(
+                    clear,
+                    () -> MarkerLegacyCommit.clear(capturedPrefs),
+                    (newer, failure) -> {
+                        // Release even if the old Activity is destroyed and its UI queue is
+                        // discarded.
+                        VideoMarkerRepository.finishClear();
+                        a.ui.post(
+                                () -> {
+                                    if (a.isFinishing()
+                                            || a.isDestroyed()
+                                            || a.switchingPrivacy
+                                            || a.generation != generation
+                                            || a.prefs != capturedPrefs
+                                            || !context.matches(
+                                                    a.config, a.privateMode, a.engineEpoch)) return;
+                                    if (a.playbackControls != null)
+                                        a.playbackControls.resetMarkers();
+                                    if (failure != null) {
+                                        a.notice(
+                                                newer
+                                                        ? "新标记已清空，旧记录写盘未确认，请重新检查"
+                                                        : "新标记清除未确认，旧记录保留：" + failure.getMessage());
+                                        return;
+                                    }
+                                    a.toast("已清除当前空间的片头片尾记录");
+                                    if (onChanged != null) onChanged.run();
+                                });
+                    });
+        } catch (RuntimeException rejected) {
+            VideoMarkerRepository.finishClear();
+            a.notice("清除任务未启动，原记录保留");
         }
     }
 
     void skip(boolean intro) {
+        if (a.isTvDevice() && !a.isLive() && !a.isCast()) {
+            markers().manage(intro);
+            return;
+        }
         int curPos = a.player != null && a.prepared ? a.player.getCurrentPosition() : 0;
         int curDur = a.player != null && a.prepared ? a.player.getDuration() : 0;
         showSkipAdjuster(a, site, video, intro, curPos, curDur, this::updateLabels);
@@ -2439,23 +3365,28 @@ final class PlaybackControls {
     static void showVideoSkipRecordsDialog(MainActivity a, Runnable onChanged) {
         if (a == null) return;
         int count = countVideoSkipRecords(a);
+        int v2Count = a.isTvDevice() ? VideoMarkerRepository.count(a) : 0;
         AppDialog.Builder b =
                 new AppDialog.Builder(a)
                         .setTitle("片头片尾独立记录")
                         .setMessage(
-                                "每部影片在播放页面点击「片头」或「片尾」按钮时，会优先默认记录当前播放时间，并支持按秒微调。\n\n"
-                                        + "记录仅对当前影片独立生效，不会全局同步影响其他影视。\n"
-                                        + "当前本机已保存："
-                                        + count
-                                        + " 部影片记录。")
+                                a.isTvDevice()
+                                        ? "旧记录为片头持续秒数/片尾剩余秒数；新标记为本集本线路绝对毫秒节点，互不改写。\n旧记录："
+                                                + count
+                                                + "，新标记："
+                                                + (v2Count < 0 ? "读取失败，原文件保留" : v2Count)
+                                                + "。\n清空将删除本空间两代记录及当前会话标记；不影响另一空间或远端。"
+                                        : "每部影片在播放页面点击「片头」或「片尾」按钮时，会优先默认记录当前播放时间，并支持按秒微调。\n\n"
+                                                + "记录仅对当前影片独立生效，不会全局同步影响其他影视。\n"
+                                                + "当前本机已保存："
+                                                + count
+                                                + " 部影片记录。")
                         .setNegativeButton("关闭", null);
-        if (count > 0) {
+        if (count > 0 || a.isTvDevice()) {
             b.setPositiveButton(
                     "清空全部记录",
                     (d, w) -> {
-                        clearVideoSkipRecords(a);
-                        a.toast("已清空全部影片的片头片尾记录");
-                        if (onChanged != null) onChanged.run();
+                        clearVideoSkipRecords(a, onChanged);
                     });
         }
         b.show();
@@ -2497,7 +3428,11 @@ final class PlaybackControls {
         String rawTitle = video.title != null ? video.title.trim() : "";
         String movieLabel = rawTitle.isEmpty() ? "当前影片" : "《" + rawTitle + "》";
         TextView title =
-                a.text((intro ? "设置本片跳过片头" : "设置本片跳过片尾") + " · 独立记录", 17, MainActivity.WHITE);
+                a.text(
+                        (intro ? "设置本片跳过片头" : "设置本片跳过片尾")
+                                + (a.isTvDevice() ? " · 旧记录（秒）" : " · 独立记录"),
+                        17,
+                        MainActivity.WHITE);
         title.setTypeface(null, android.graphics.Typeface.BOLD);
         card.addView(title);
         a.gap(card, 6);
@@ -2530,8 +3465,11 @@ final class PlaybackControls {
                     currentSecRef[0] = clamped;
                     setVideoSkip(a, site, video, intro, clamped);
                     if (!intro && a.player != null && !"live".equals(site.key)) {
-                        a.player.setRepeatOne(
-                                a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1 && clamped == 0);
+                        if (a.isTvDevice() && a.playbackControls != null)
+                            a.playbackControls.refreshMarkerPlaybackMode();
+                        else
+                            a.player.setRepeatOne(
+                                    a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1 && clamped == 0);
                     }
                     if (bar.getProgress() != clamped) bar.setProgress(clamped);
                     valueLabel.setText(
@@ -2691,9 +3629,83 @@ final class PlaybackControls {
                 i -> {
                     a.prefs.edit().putInt(Prefs.REPEAT_MODE, i).apply();
                     if (a.player != null)
-                        a.player.setRepeatOne(i == 1 && getVideoOutro(a, site, video) == 0);
+                        a.player.setRepeatOne(
+                                i == 1
+                                        && (a.isTvDevice()
+                                                ? outroPosition(a.player.getDuration()) == 0
+                                                : getVideoOutro(a, site, video) == 0));
                     updateLabels();
                 });
+    }
+
+    void sleepTimerMenu() {
+        long now = android.os.SystemClock.uptimeMillis();
+        choose(
+                "定时关闭（" + SESSION_SLEEP_TIMER.summaryLabel(now) + "）",
+                SleepTimerSheet.PRESET_LABELS,
+                SESSION_SLEEP_TIMER.getMode(),
+                idx -> {
+                    long t = android.os.SystemClock.uptimeMillis();
+                    SESSION_SLEEP_TIMER.selectPreset(idx, t);
+                    if (sleepWarningPill != null) sleepWarningPill.hide();
+                    a.toast(
+                            idx == SleepTimerSheet.MODE_OFF
+                                    ? "已关闭定时停止"
+                                    : "已开启定时关闭：" + SleepTimerSheet.PRESET_LABELS[idx]);
+                });
+    }
+
+    private void triggerSleepExpiry() {
+        if (sleepWarningPill != null) sleepWarningPill.hide();
+        if (skipCountdownPill != null) skipCountdownPill.dismissSilently();
+        if (a.player != null && a.prepared) {
+            try {
+                a.player.pause();
+            } catch (Exception ignored) {
+            }
+        }
+        a.playing = false;
+        if (a.getWindow() != null) {
+            a.getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
+        if (a.playStatus != null) {
+            a.playStatus.setText("定时关闭已触发 · 已暂停播放");
+        }
+        a.toast("定时关闭已到点，已暂停播放");
+        a.showControls(true);
+    }
+
+    private void executeSkipAction(boolean intro, int targetPositionMs) {
+        if (a.player == null || !a.prepared || transitioning || !canRunSkipCountdown()) return;
+        if (intro) {
+            int duration = a.player.getDuration();
+            if (duration > 0 && targetPositionMs > 0 && targetPositionMs < duration - 1000) {
+                recordUserSeek(targetPositionMs);
+                a.player.seekTo(targetPositionMs);
+                a.toast("已跳过片头");
+            }
+            return;
+        }
+        if (SESSION_SLEEP_TIMER.onEpisodeCompleted()) {
+            triggerSleepExpiry();
+            return;
+        }
+        int duration = a.player.getDuration();
+        long tailNode = outroPosition(duration);
+        if (a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1) {
+            int target = introPosition(duration);
+            if (a.isTvDevice()) {
+                if (tailNode > 0 && target >= tailNode) target = 0;
+                recordUserSeek(target);
+            }
+            a.player.seekTo(target);
+        } else if (!step(1)) {
+            transitioning = true;
+            a.player.pause();
+            a.playing = false;
+            a.playStatus.setText("已跳过片尾");
+            a.showControls(true);
+        }
     }
 
     void more() {
@@ -2701,12 +3713,15 @@ final class PlaybackControls {
             final String clockKey =
                     a.isTvDevice() ? Prefs.TV_PLAYER_TOP_RIGHT_HUD : Prefs.PLAYER_ALWAYS_SHOW_CLOCK;
             boolean alwaysClock = a.prefs.getBoolean(clockKey, a.isTvDevice());
+            String sleepSummary =
+                    SESSION_SLEEP_TIMER.summaryLabel(android.os.SystemClock.uptimeMillis());
             String[] live = {
                 "上一频道",
                 "选择频道",
                 "播放线路",
                 "播放器与解码",
                 "画面色彩",
+                "定时关闭：" + sleepSummary,
                 (a.isTvDevice() ? "右上角进度与时间：" : "播放页常显时间：") + (alwaysClock ? "开启" : "关闭"),
                 "播放信息",
                 "返回频道列表"
@@ -2741,10 +3756,13 @@ final class PlaybackControls {
                                 pictureEffect();
                                 break;
                             case 5:
+                                sleepTimerMenu();
+                                break;
+                            case 6:
                                 a.prefs.edit().putBoolean(clockKey, !alwaysClock).apply();
                                 if (a.playerChrome != null) a.playerChrome.syncClockViews();
                                 break;
-                            case 6:
+                            case 7:
                                 message(
                                         a.player == null
                                                 ? "播放器尚未准备好。"
@@ -2752,7 +3770,8 @@ final class PlaybackControls {
                                                         + "\n"
                                                         + surface.outputName());
                                 break;
-                            case 7:
+                            case 8:
+                                clearSleepTimerOnLeave();
                                 a.leavePlayback();
                                 break;
                         }
@@ -2762,6 +3781,8 @@ final class PlaybackControls {
         final String clockKey =
                 a.isTvDevice() ? Prefs.TV_PLAYER_TOP_RIGHT_HUD : Prefs.PLAYER_ALWAYS_SHOW_CLOCK;
         boolean alwaysClock = a.prefs.getBoolean(clockKey, a.isTvDevice());
+        String sleepSummary =
+                SESSION_SLEEP_TIMER.summaryLabel(android.os.SystemClock.uptimeMillis());
         String[] labels = {
             "画面比例",
             "字幕与显示",
@@ -2769,6 +3790,7 @@ final class PlaybackControls {
             "从头重播",
             "上一集",
             "跳过片头 / 片尾（本片独立）",
+            "定时关闭：" + sleepSummary,
             "弹幕",
             modernTv ? "播放器与解码" : "音效",
             "画面色彩",
@@ -2813,26 +3835,35 @@ final class PlaybackControls {
                             choose(
                                     "本片自动跳过（独立记录）",
                                     new String[] {
-                                        "本片片头 · " + skipLabel(getVideoIntro(a, site, video)),
-                                        "本片片尾 · " + skipLabel(getVideoOutro(a, site, video))
+                                        a.isTvDevice()
+                                                ? "片头 · 标记与旧记录"
+                                                : "本片片头 · "
+                                                        + skipLabel(getVideoIntro(a, site, video)),
+                                        a.isTvDevice()
+                                                ? "片尾 · 标记与旧记录"
+                                                : "本片片尾 · "
+                                                        + skipLabel(getVideoOutro(a, site, video))
                                     },
                                     -1,
                                     n -> skip(n == 0));
                             break;
                         case 6:
-                            danmaku();
+                            sleepTimerMenu();
                             break;
                         case 7:
+                            danmaku();
+                            break;
+                        case 8:
                             if (modernTv) decoderMenu();
                             else soundEffect();
                             break;
-                        case 8:
+                        case 9:
                             pictureEffect();
                             break;
-                        case 9:
+                        case 10:
                             repeat();
                             break;
-                        case 10:
+                        case 11:
                             a.prefs
                                     .edit()
                                     .putBoolean(
@@ -2840,11 +3871,11 @@ final class PlaybackControls {
                                             !a.prefs.getBoolean(Prefs.AUTO_NEXT, true))
                                     .apply();
                             break;
-                        case 11:
+                        case 12:
                             a.prefs.edit().putBoolean(clockKey, !alwaysClock).apply();
                             if (a.playerChrome != null) a.playerChrome.syncClockViews();
                             break;
-                        case 12:
+                        case 13:
                             message(
                                     a.player == null
                                             ? "播放器尚未准备好。"
@@ -2852,7 +3883,8 @@ final class PlaybackControls {
                                                     + "\n"
                                                     + surface.outputName());
                             break;
-                        case 13:
+                        case 14:
+                            clearSleepTimerOnLeave();
                             a.leavePlayback();
                             break;
                     }
@@ -2873,7 +3905,11 @@ final class PlaybackControls {
             }
         }
         Button introBtn = buttons.get("skip-intro-tool");
-        if (introBtn != null) {
+        if (introBtn != null && a.isTvDevice()) {
+            introBtn.setContentDescription("片头标记与旧记录");
+            if (!(introBtn instanceof ModernIconButton)) introBtn.setText("片头标记");
+            introBtn.invalidate();
+        } else if (introBtn != null) {
             int s = getVideoIntro(a, site, video);
             if (introBtn instanceof ModernIconButton) {
                 introBtn.setContentDescription(s > 0 ? "片头 " + s + "s" : "片头");
@@ -2883,7 +3919,11 @@ final class PlaybackControls {
             }
         }
         Button outroBtn = buttons.get("skip-outro-tool");
-        if (outroBtn != null) {
+        if (outroBtn != null && a.isTvDevice()) {
+            outroBtn.setContentDescription("片尾标记与旧记录");
+            if (!(outroBtn instanceof ModernIconButton)) outroBtn.setText("片尾标记");
+            outroBtn.invalidate();
+        } else if (outroBtn != null) {
             int s = getVideoOutro(a, site, video);
             if (outroBtn instanceof ModernIconButton) {
                 outroBtn.setContentDescription(s > 0 ? "片尾 " + s + "s" : "片尾");
@@ -2923,6 +3963,7 @@ final class PlaybackControls {
         }
         if (a.prefs.getBoolean(Prefs.DANMAKU_DEFAULT, true)
                 && (!danmakuLoaded || !rewritten.equals(previous))) {
+            closeSegmentedDanmuSession();
             danmakuLoaded = true;
             danmaku.enabled(true);
             danmaku.load(
@@ -2939,6 +3980,19 @@ final class PlaybackControls {
     }
 
     void prepared() {
+        resetEpisodeTransientState();
+        if (a.isTvDevice() && !a.isLive() && !a.isCast()) {
+            markerObservedPlayer = a.player;
+            final MoviePlayer owner = markerObservedPlayer;
+            owner.setOnSeekPositionListener(
+                    (player, actualPosition) -> {
+                        if (a.playbackControls == this
+                                && a.player == owner
+                                && player == owner
+                                && markerObservedPlayer == owner)
+                            markerTail.observe(actualPosition);
+                    });
+        }
         if (a.player == null) return;
         if (resolved.media.optString("danmaku").isEmpty()) {
             String recentDm = CspEngine.consumeRecentPluginDanmaku(25000L);
@@ -2961,6 +4015,15 @@ final class PlaybackControls {
 
                         public void error(String message) {}
                     });
+        } else if (!danmakuLoaded && !a.isLive() && !a.isCast()) {
+            DanmuSettingsPanel.DanmuConfig dmCfg = DanmuSettingsPanel.loadConfig(a, a.isTvDevice());
+            danmaku.applyConfig(dmCfg);
+            if (dmCfg.enabled && !dmCfg.serverUrls.isEmpty()) {
+                startSegmentedDanmuSession(dmCfg, false);
+            }
+        }
+        if (danmuMountHook != null) {
+            danmuMountHook.run();
         }
         PlaybackEffects.picture(surface, a.prefs.getInt(Prefs.PICTURE_EFFECT, 0));
         try {
@@ -2980,16 +4043,27 @@ final class PlaybackControls {
         int seek =
                 ("live".equals(site.key) || explicitRestart)
                         ? 0
-                        : historyResume ? a.resumeAt : getVideoIntro(a, site, video) * 1000;
+                        : historyResume ? a.resumeAt : introPosition(a.player.getDuration());
         a.resumeAt = 0;
         if (seek > 0) {
             if (duration > 0) {
                 if (seek < duration - 1000) {
                     pendingResumeMs = 0;
-                    recordUserSeek(seek);
-                    a.player.seekTo(seek);
-                    if (historyResume) {
-                        a.toast("已为您续播至 " + PlaybackController.formatTime(seek));
+                    if (!historyResume
+                            && !a.miniMode
+                            && skipCountdownPill != null
+                            && PlayerHudPrefs.isSkipCountdownEnabled(a)) {
+                        pendingIntroSkipMs = seek;
+                        boolean hasModalDialog = activeDialog != null && activeDialog.isShowing();
+                        if (canRunSkipCountdown()) {
+                            skipCountdownPill.start(true, seek, !a.controlsVisible, hasModalDialog);
+                        }
+                    } else {
+                        recordUserSeek(seek);
+                        a.player.seekTo(seek);
+                        if (historyResume) {
+                            a.toast("已为您续播至 " + PlaybackController.formatTime(seek));
+                        }
                     }
                 }
             } else {
@@ -3000,16 +4074,63 @@ final class PlaybackControls {
             }
         }
         if (!"live".equals(site.key)) {
-            a.player.setSpeed(a.prefs.getFloat(Prefs.PLAY_SPEED, 1));
+            float speed = a.prefs.getFloat(Prefs.PLAY_SPEED, 1);
+            a.player.setSpeed(speed);
+            onDanmuPlaySpeedChanged(speed);
             a.player.setRepeatOne(
                     a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1
-                            && getVideoOutro(a, site, video) == 0);
+                            && (a.isTvDevice()
+                                    ? outroPosition(duration) == 0
+                                    : getVideoOutro(a, site, video) == 0));
         }
         syncModernActionVisibility();
         refreshPlayPauseGlyph();
+        maybeShowFirstPlayGestureHint();
+    }
+
+    private void tickSleepTimer() {
+        if (!SESSION_SLEEP_TIMER.isActive()) {
+            hideSleepWarning();
+            return;
+        }
+        long now = android.os.SystemClock.uptimeMillis();
+        if (SESSION_SLEEP_TIMER.tick(now)) {
+            triggerSleepExpiry();
+            return;
+        }
+        if (sleepWarningPill != null) {
+            if (SESSION_SLEEP_TIMER.shouldShowPreExpiryWarning(now)) {
+                boolean wasShowing = sleepWarningPill.isShowing();
+                long secLeft = (SESSION_SLEEP_TIMER.remainingMs(now) + 999L) / 1000L;
+                sleepWarningPill.showCountdownSeconds(secLeft);
+                if (!wasShowing) {
+                    syncSleepWarningTvFocusLinks(true);
+                    if (a.isTvDevice()
+                            && !dialogOpen
+                            && (activeDialog == null || !activeDialog.isShowing())
+                            && a.markerHost == null
+                            && !a.seekGesture.active
+                            && (skipCountdownPill == null || !skipCountdownPill.isActive())) {
+                        if (!a.controlsVisible) {
+                            a.showControls(true);
+                        }
+                        sleepWarningPill.requestInitialTvFocus();
+                    }
+                }
+            } else {
+                hideSleepWarning();
+            }
+        }
     }
 
     void tick() {
+        if (a.touchPlayerGesture != null) {
+            a.touchPlayerGesture.syncRuntimeState();
+        }
+        syncDanmuPlaybackState();
+        syncSkipCountdownLifecycle();
+        tickSleepTimer();
+        if (a.isTvDevice() && (a.markerHost != null || a.seekGesture.active)) return;
         if ("live".equals(site.key)) return;
         if (a.player == null || !a.prepared || isUserSeeking()) return;
         int duration = a.player.getDuration();
@@ -3025,7 +4146,12 @@ final class PlaybackControls {
                 a.player.seekTo(target);
             }
         }
-        int position = displayPosition(a.player.getCurrentPosition());
+        int actualPosition = a.player.getCurrentPosition();
+        reconcileDetachedSegmentedDanmuSession();
+        if (danmuSegmentCache != null && danmaku.enabled && danmaku.hasSegmentCache()) {
+            danmuSegmentCache.onPlaybackTick(actualPosition, a.player.isPlaying());
+        }
+        int position = displayPosition(actualPosition);
         if (duration > 0) {
             timeline.setEnabled(true);
             timeline.setMax(Math.max(duration, position));
@@ -3035,26 +4161,48 @@ final class PlaybackControls {
             timeline.setMax(100);
             timeline.setProgress(0);
         }
-        int tail = getVideoOutro(a, site, video) * 1000;
+        if (pendingIntroSkipMs > 0 && duration > 0) {
+            if (actualPosition >= pendingIntroSkipMs - 1000
+                    || pendingIntroSkipMs >= duration - 1000) {
+                pendingIntroSkipMs = 0;
+            } else if (skipCountdownPill != null
+                    && !skipCountdownPill.isActive()
+                    && PlayerHudPrefs.isSkipCountdownEnabled(a)
+                    && canRunSkipCountdown()) {
+                boolean hasModalDialog = activeDialog != null && activeDialog.isShowing();
+                skipCountdownPill.start(
+                        true, pendingIntroSkipMs, !a.controlsVisible, hasModalDialog);
+            }
+        }
+        long tailNode = outroPosition(duration);
+        markerTail.node(tailNode);
+        markerTail.observe(actualPosition);
         if (!transitioning
-                && a.playing
+                && !outroSkipCancelledForEpisode
+                && canRunSkipCountdown()
                 && duration > 0
-                && tail > 0
-                && tail < duration
-                && position >= duration - tail) {
-            if (a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 1)
-                a.player.seekTo(getVideoIntro(a, site, video) * 1000);
-            else if (!step(1)) {
-                transitioning = true;
-                a.player.pause();
-                a.playing = false;
-                a.playStatus.setText("已跳过片尾");
-                a.showControls(true);
+                && tailNode > 0
+                && tailNode < duration
+                && (a.isTvDevice() ? markerTail.take(actualPosition) : position >= tailNode)) {
+            if (!a.miniMode
+                    && skipCountdownPill != null
+                    && PlayerHudPrefs.isSkipCountdownEnabled(a)) {
+                if (!skipCountdownPill.isActive()) {
+                    boolean hasModalDialog = activeDialog != null && activeDialog.isShowing();
+                    skipCountdownPill.start(
+                            false, (int) tailNode, !a.controlsVisible, hasModalDialog);
+                }
+            } else {
+                executeSkipAction(false, (int) tailNode);
             }
         }
     }
 
     void completed() {
+        if (SESSION_SLEEP_TIMER.onEpisodeCompleted()) {
+            triggerSleepExpiry();
+            return;
+        }
         if (!transitioning
                 && (a.prefs.getBoolean(Prefs.AUTO_NEXT, true)
                         || a.prefs.getInt(Prefs.REPEAT_MODE, 0) == 2)
@@ -3083,6 +4231,14 @@ final class PlaybackControls {
     }
 
     void visible(boolean visible) {
+        if (a.isTvDevice()
+                && visible
+                && !lastControlsVisibleForSkip
+                && skipCountdownPill != null
+                && skipCountdownPill.isActive()) {
+            skipCountdownPill.onExternalControlsShown();
+        }
+        lastControlsVisibleForSkip = visible;
         int bottomDp = Prefs.clampSubtitleBottom(a.prefs.getInt(Prefs.SUBTITLE_BOTTOM, 24));
         int basePx = a.dp(bottomDp);
         FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) subtitle.getLayoutParams();

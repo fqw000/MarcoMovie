@@ -1,6 +1,10 @@
 import 'dart:io' show Platform;
 import 'dart:math' as math;
 import 'dart:ui';
+import '../core/ohos_runtime.dart';
+import 'ios_liquid_glass.dart';
+import 'motion/aurora_background.dart';
+import 'motion/motion_tokens.dart';
 import 'windows_appearance.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/foundation.dart'
@@ -307,6 +311,14 @@ class _LiquidRimPainter extends CustomPainter {
       old.shape != shape || old.strength != strength;
 }
 
+bool _isSystemReduceTransparencyActive() =>
+    !OhosRuntime.isOhos && IosLiquidGlassBridge.reduceTransparency;
+
+final Listenable _sharedReduceTransparencyListenable = Listenable.merge([
+  GlassworkBackdrop.reduceTransparency,
+  IosLiquidGlassBridge.reduceTransparencyNotifier,
+]);
+
 /// Native equivalent of Glasswork's clipped rim, with an inexpensive blur on
 /// renderers that cannot sample the backdrop through a fragment shader.
 class GlassworkBackdrop extends StatefulWidget {
@@ -322,21 +334,32 @@ class GlassworkBackdrop extends StatefulWidget {
 class _GlassworkBackdropState extends State<GlassworkBackdrop> {
   static Future<FragmentProgram>? _program;
   FragmentShader? _shader;
+  bool _loadingLens = false;
   late final Listenable _mergedListenable = Listenable.merge([
     GlassworkBackdrop.reduceTransparency,
     GlassworkBackdrop.intensity,
+    IosLiquidGlassBridge.reduceTransparencyNotifier,
   ]);
   @override
   void initState() {
     super.initState();
-    if (!_isWindowsDesktop && ImageFilter.isShaderFilterSupported) _loadLens();
+    if (!_isWindowsDesktop &&
+        !GlassworkBackdrop.reduceTransparency.value &&
+        !_isSystemReduceTransparencyActive() &&
+        ImageFilter.isShaderFilterSupported) {
+      _loadLens();
+    }
   }
   Future<void> _loadLens() async {
+    if (_loadingLens) return;
+    _loadingLens = true;
     try {
       final program = await (_program ??= FragmentProgram.fromAsset('shaders/glasswork.frag'));
       if (mounted) setState(() => _shader = program.fragmentShader());
     } catch (_) {
       // Fallback is also used while the GPU program is being prepared.
+    } finally {
+      _loadingLens = false;
     }
   }
   @override
@@ -349,14 +372,22 @@ class _GlassworkBackdropState extends State<GlassworkBackdrop> {
     return AnimatedBuilder(
       animation: _mergedListenable,
       builder: (context, _) {
-        final reduce = GlassworkBackdrop.reduceTransparency.value;
+        final reduce = GlassworkBackdrop.reduceTransparency.value ||
+            _isSystemReduceTransparencyActive();
         final strength = GlassworkBackdrop.intensity.value.clamp(0.0, 1.0);
         final opaque = reduce ||
             strength <= 0.02 ||
             MediaQuery.highContrastOf(context) ||
             MediaQuery.disableAnimationsOf(context);
         final winFastGlass = _isWindowsDesktop;
-        final shader = winFastGlass ? null : _shader;
+        if (!opaque &&
+            !winFastGlass &&
+            _shader == null &&
+            !_loadingLens &&
+            ImageFilter.isShaderFilterSupported) {
+          _loadLens();
+        }
+        final shader = (winFastGlass || opaque) ? null : _shader;
         if (shader != null) {
           shader.setFloat(2, widget.radius);
           shader.setFloat(
@@ -457,8 +488,37 @@ class LiquidGlass extends StatelessWidget {
       child: ClipPath(
         clipper: ShapeBorderClipper(shape: shape),
         clipBehavior: Clip.antiAlias,
-        child: (MediaQuery.highContrastOf(context) || MediaQuery.disableAnimationsOf(context))
-            ? CustomPaint(
+        child: AnimatedBuilder(
+          animation: _sharedReduceTransparencyListenable,
+          builder: (context, _) {
+            final systemReduce = GlassworkBackdrop.reduceTransparency.value ||
+                _isSystemReduceTransparencyActive();
+            if (systemReduce) {
+              final solidBase = tint.a > 0.01
+                  ? Color.alphaBlend(
+                      tint.withValues(alpha: math.min(tint.a, 0.35)),
+                      const Color(0xF51E1E22),
+                    )
+                  : const Color(0xF51E1E22);
+              return Container(
+                width: width,
+                height: height,
+                decoration: ShapeDecoration(
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(borderRadius),
+                    side: BorderSide(
+                      color: Colors.white.withValues(alpha: 0.48),
+                      width: 1.0,
+                    ),
+                  ),
+                  color: solidBase,
+                ),
+                child: content,
+              );
+            }
+            if (MediaQuery.highContrastOf(context) ||
+                MediaQuery.disableAnimationsOf(context)) {
+              return CustomPaint(
                 foregroundPainter:
                     _LiquidRimPainter(shape: shape, strength: rimStrength),
                 child: Container(
@@ -485,46 +545,49 @@ class LiquidGlass extends StatelessWidget {
                   ),
                   child: content,
                 ),
-              )
-            : GlassworkBackdrop(
-                radius: borderRadius,
-                child: ValueListenableBuilder<double>(
-                  valueListenable: GlassworkBackdrop.intensity,
-                  builder: (context, strength, _) {
-                    final s = strength.clamp(0.0, 1.0);
-                    return CustomPaint(
-                      foregroundPainter: _LiquidRimPainter(
+              );
+            }
+            return GlassworkBackdrop(
+              radius: borderRadius,
+              child: ValueListenableBuilder<double>(
+                valueListenable: GlassworkBackdrop.intensity,
+                builder: (context, strength, _) {
+                  final s = strength.clamp(0.0, 1.0);
+                  return CustomPaint(
+                    foregroundPainter: _LiquidRimPainter(
+                      shape: shape,
+                      strength: rimStrength * (0.28 + 0.92 * s),
+                    ),
+                    child: Container(
+                      width: width,
+                      height: height,
+                      decoration: ShapeDecoration(
                         shape: shape,
-                        strength: rimStrength * (0.28 + 0.92 * s),
-                      ),
-                      child: Container(
-                        width: width,
-                        height: height,
-                        decoration: ShapeDecoration(
-                          shape: shape,
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              Color.alphaBlend(
-                                Color.fromRGBO(255, 255, 255, 0.03 + 0.08 * s),
-                                tint.withValues(alpha: math.min(tint.a, 0.08)),
-                              ),
-                              tint.withValues(alpha: math.min(tint.a, 0.04)),
-                              Color.alphaBlend(
-                                Color.fromRGBO(255, 255, 255, 0.015 + 0.045 * s),
-                                tint.withValues(alpha: math.min(tint.a, 0.06)),
-                              ),
-                            ],
-                            stops: const [0.0, 0.52, 1.0],
-                          ),
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Color.alphaBlend(
+                              Color.fromRGBO(255, 255, 255, 0.03 + 0.08 * s),
+                              tint.withValues(alpha: math.min(tint.a, 0.08)),
+                            ),
+                            tint.withValues(alpha: math.min(tint.a, 0.04)),
+                            Color.alphaBlend(
+                              Color.fromRGBO(255, 255, 255, 0.015 + 0.045 * s),
+                              tint.withValues(alpha: math.min(tint.a, 0.06)),
+                            ),
+                          ],
+                          stops: const [0.0, 0.52, 1.0],
                         ),
-                        child: content,
                       ),
-                    );
-                  },
-                ),
+                      child: content,
+                    ),
+                  );
+                },
               ),
+            );
+          },
+        ),
       ),
     );
   }
@@ -625,8 +688,31 @@ class AppleGlassSurface extends StatelessWidget {
       child: ClipRRect(
         borderRadius: radius,
         clipBehavior: Clip.antiAlias,
-        child: (MediaQuery.highContrastOf(context) || MediaQuery.disableAnimationsOf(context))
-            ? CustomPaint(
+        child: AnimatedBuilder(
+          animation: _sharedReduceTransparencyListenable,
+          builder: (context, _) {
+            final systemReduce = GlassworkBackdrop.reduceTransparency.value ||
+                _isSystemReduceTransparencyActive();
+            if (systemReduce) {
+              return Container(
+                width: width,
+                height: height,
+                padding: padding,
+                decoration: BoxDecoration(
+                  color: const Color(0xF51E1E22),
+                  borderRadius: radius,
+                  border: border ??
+                      Border.all(
+                        color: Colors.white.withValues(alpha: 0.48),
+                        width: 1.0,
+                      ),
+                ),
+                child: child,
+              );
+            }
+            if (MediaQuery.highContrastOf(context) ||
+                MediaQuery.disableAnimationsOf(context)) {
+              return CustomPaint(
                 foregroundPainter: border == null
                     ? _LiquidRimPainter(shape: shape, strength: 0.8)
                     : null,
@@ -655,61 +741,71 @@ class AppleGlassSurface extends StatelessWidget {
                   ),
                   child: child,
                 ),
-              )
-            : GlassworkBackdrop(
-                radius: radius.topLeft.x,
-                child: ValueListenableBuilder<double>(
-                  valueListenable: GlassworkBackdrop.intensity,
-                  builder: (context, strength, _) {
-                    final s = strength.clamp(0.0, 1.0);
-                    return CustomPaint(
-                      foregroundPainter: border == null
-                          ? _LiquidRimPainter(
-                              shape: shape,
-                              strength: 0.25 + 0.85 * s,
-                            )
-                          : null,
-                      child: Container(
-                        width: width,
-                        height: height,
-                        padding: padding,
-                        decoration: BoxDecoration(
-                          gradient: LinearGradient(
-                            begin: Alignment.topLeft,
-                            end: Alignment.bottomRight,
-                            colors: [
-                              Color.alphaBlend(
-                                Color.fromRGBO(255, 255, 255, 0.02 + 0.07 * s),
-                                effectiveColor.withValues(alpha: math.min(effectiveColor.a, .04)),
-                              ),
-                              effectiveColor.withValues(alpha: math.min(effectiveColor.a, .02)),
-                            ],
-                          ),
-                          borderRadius: radius,
-                          border: border,
+              );
+            }
+            return GlassworkBackdrop(
+              radius: radius.topLeft.x,
+              child: ValueListenableBuilder<double>(
+                valueListenable: GlassworkBackdrop.intensity,
+                builder: (context, strength, _) {
+                  final s = strength.clamp(0.0, 1.0);
+                  return CustomPaint(
+                    foregroundPainter: border == null
+                        ? _LiquidRimPainter(
+                            shape: shape,
+                            strength: 0.25 + 0.85 * s,
+                          )
+                        : null,
+                    child: Container(
+                      width: width,
+                      height: height,
+                      padding: padding,
+                      decoration: BoxDecoration(
+                        gradient: LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [
+                            Color.alphaBlend(
+                              Color.fromRGBO(255, 255, 255, 0.02 + 0.07 * s),
+                              effectiveColor.withValues(alpha: math.min(effectiveColor.a, .04)),
+                            ),
+                            effectiveColor.withValues(alpha: math.min(effectiveColor.a, .02)),
+                          ],
                         ),
-                        child: child,
+                        borderRadius: radius,
+                        border: border,
                       ),
-                    );
-                  },
-                ),
+                      child: child,
+                    ),
+                  );
+                },
               ),
+            );
+          },
+        ),
       ),
     );
   }
 }
 
-/// iOS 27 Liquid Glass tab bar (Dock):
-/// - Portrait: floating glass bar (`64dp`) above the home indicator.
-/// - Landscape: compact vertical glass bar on the right edge.
-/// - Supports both discrete taps AND continuous press-and-slide (`按住左右/上下滑动聚焦切换`):
-///   holding and sliding across the dock smoothly glides the lighter glass lens
-///   under the finger and switches tabs live with haptic selection clicks.
+/// iOS 26 Liquid Glass floating tab bar (Dock):
+/// - Portrait on iOS 26+: true native UIKit `UITabBar` floating glass capsule +
+///   detached circular `UIButton.Configuration.glass()` search button.
+/// - Portrait fallback (iOS 15–18 / Android / Desktop / Tests): matching full-capsule
+///   Liquid Glass pill (`62dp`) with dark inner selection capsule + detached circular
+///   search button on the right.
+/// - Landscape: compact vertical glass pill on the right edge + circular search button.
+/// - Supports both discrete taps AND continuous press-and-slide (`按住左右/上下滑动聚焦切换`).
 class AppleLiquidGlassDock extends StatefulWidget {
   final int selectedIndex;
   final ValueChanged<int> onSelect;
   final bool isLandscape;
   final List<(IconData, IconData, String)> items;
+  final List<IosNativeDockItem>? nativeItems;
+  final VoidCallback? onSearch;
+  final VoidCallback? onScrollToTop;
+  final bool hidden;
+  final bool collapsed;
 
   const AppleLiquidGlassDock({
     super.key,
@@ -717,13 +813,19 @@ class AppleLiquidGlassDock extends StatefulWidget {
     required this.onSelect,
     required this.isLandscape,
     required this.items,
+    this.nativeItems,
+    this.onSearch,
+    this.onScrollToTop,
+    this.hidden = false,
+    this.collapsed = false,
   });
 
-  static const double _dockRadius = 26;
-  static const double _lensRadius = 20;
-  static const double _pad = 6;
+  static const double _dockRadius = 31;
+  static const double _lensRadius = 26;
+  static const double _pad = 5;
   static const double _itemH = 52;
   static const double _itemW = 60;
+  static const double _searchGap = 10;
   static const Duration _motion = Duration(milliseconds: 420);
   static const Curve _curve = Cubic(0.2, 1.15, 0.36, 1.0);
 
@@ -732,9 +834,10 @@ class AppleLiquidGlassDock extends StatefulWidget {
     final right = MediaQuery.paddingOf(context).right;
     return _itemW + _pad * 2 + (right > 0 ? right + 4 : 10) + 8;
   }
+
   static double portraitFootprint(BuildContext context) {
     final safe = MediaQuery.paddingOf(context).bottom;
-    return _itemH + 2 * _pad + (safe > 0 ? math.max(safe - 4, 8) : 12) + 8;
+    return _itemH + 2 * _pad + (safe > 0 ? math.max(safe - 14, 10) : 12) + 8;
   }
 
   @override
@@ -774,34 +877,458 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
       _dragLensSlot = null;
       _lastDragSelectedIndex = null;
     });
-    if (!cancelled && target != null && target != _safeIndex) widget.onSelect(target);
+    if (!cancelled && target != null && target != _safeIndex) {
+      widget.onSelect(target);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final safe = MediaQuery.paddingOf(context);
-    final margin = widget.isLandscape
-        ? EdgeInsets.only(
-            right: safe.right > 0 ? safe.right + 4 : 10,
-            top: 12,
-            bottom: 12,
-          )
-        : EdgeInsets.only(
-            left: 20,
-            right: 20,
-            bottom: safe.bottom > 0 ? math.max(safe.bottom - 4, 8) : 12,
+    final portraitBottom =
+        safe.bottom > 0 ? math.max(safe.bottom - 14.0, 10.0) : 12.0;
+
+    return IosNativeRouteGate(
+      builder: (context, nativeActive) {
+        final useNativeIos26 = nativeActive &&
+            !widget.isLandscape &&
+            widget.nativeItems != null &&
+            widget.nativeItems!.isNotEmpty;
+        if (useNativeIos26) {
+          return Padding(
+            padding: EdgeInsets.only(bottom: portraitBottom),
+            child: IosNativeDockView(
+              selectedIndex: _safeIndex,
+              items: widget.nativeItems!,
+              onSelect: widget.onSelect,
+              onSearch: widget.onSearch,
+              onScrollToTop: widget.onScrollToTop,
+              showSearch: widget.onSearch != null,
+              hidden: widget.hidden,
+              collapsed: widget.collapsed,
+            ),
           );
-    return Padding(
-      padding: margin,
-      child: widget.isLandscape ? _buildVertical() : _buildHorizontal(),
+        }
+
+        // On iOS 26+ during route transitions (when IosNativeRouteGate temporarily
+        // unmounts UiKitView to prevent Impeller cross-route black occlusion),
+        // render a pixel-matched, zero-BackdropFilter placeholder identical in
+        // geometry & visual style to MarcoDockContainerView so there is zero
+        // size jump or legacy-style flash.
+        if (IosLiquidGlassBridge.isAvailable &&
+            !widget.isLandscape &&
+            widget.nativeItems != null &&
+            widget.nativeItems!.isNotEmpty) {
+          Widget placeholder = Padding(
+            padding: EdgeInsets.only(bottom: portraitBottom),
+            child: _buildIos26TransitionDockPlaceholder(context),
+          );
+          if (widget.hidden) {
+            placeholder = IgnorePointer(
+              ignoring: true,
+              child: Opacity(opacity: 0, child: placeholder),
+            );
+          }
+          return placeholder;
+        }
+
+        final margin = widget.isLandscape
+            ? EdgeInsets.only(
+                right: safe.right > 0 ? safe.right + 4 : 10,
+                top: 12,
+                bottom: 12,
+              )
+            : EdgeInsets.only(
+                left: 16,
+                right: 16,
+                bottom: portraitBottom,
+              );
+        Widget content = Padding(
+          padding: margin,
+          child: widget.isLandscape
+              ? _buildVertical()
+              : AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 260),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  child: widget.collapsed
+                      ? _buildCollapsedLogoButton(context)
+                      : _buildHorizontal(),
+                ),
+        );
+        if (widget.hidden) {
+          content = IgnorePointer(
+            ignoring: true,
+            child: Opacity(opacity: 0, child: content),
+          );
+        }
+        return content;
+      },
     );
   }
 
-  Widget _shell({required Widget child}) {
+  Widget _buildIos26TransitionDockPlaceholder(BuildContext context) {
+    const totalH = 72.0;
+    const dockSize = 62.0;
+    const outerMargin = 16.0;
+    const gap = 10.0;
+    const inset = 4.0;
+    final hasSearch = widget.onSearch != null;
+    final n = math.max(widget.items.length, 1);
+
+    BoxDecoration glassDeco(double radius) => BoxDecoration(
+          borderRadius: BorderRadius.circular(radius),
+          gradient: const LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Color(0x804E4E58), Color(0x6E34343C)],
+          ),
+          border: Border.all(
+            color: Colors.white.withValues(alpha: 0.24),
+            width: 0.65,
+          ),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x36000000),
+              blurRadius: 16,
+              offset: Offset(0, 6),
+            ),
+          ],
+        );
+
+    return SizedBox(
+      key: const ValueKey('ios26-dock-transition-placeholder'),
+      width: double.infinity,
+      height: totalH,
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          final totalW = constraints.maxWidth.isFinite
+              ? constraints.maxWidth
+              : MediaQuery.sizeOf(context).width;
+          final maxRowWidth = math.min(totalW, 440.0);
+          final rowX = (totalW - maxRowWidth) * 0.5;
+
+          if (widget.collapsed) {
+            final rightInset = math.max(
+              outerMargin,
+              totalW - (rowX + maxRowWidth - outerMargin),
+            );
+            return Align(
+              alignment: Alignment.centerRight,
+              child: Padding(
+                padding: EdgeInsets.only(right: rightInset),
+                child: SizedBox(
+                  width: dockSize,
+                  height: dockSize,
+                  child: DecoratedBox(
+                    decoration: glassDeco(dockSize * 0.5),
+                    child: const Center(
+                      child: MarcoBrandLogo(
+                        iconSize: 32,
+                        showWordmark: false,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            );
+          }
+
+          final tabW = hasSearch
+              ? math.max(
+                  maxRowWidth - outerMargin * 2 - dockSize - gap,
+                  180.0,
+                )
+              : math.max(maxRowWidth - outerMargin * 2, 180.0);
+          final innerW = tabW - inset * 2;
+          final slotW = innerW / n;
+          const lensH = dockSize - inset * 2;
+
+          return Center(
+            child: SizedBox(
+              width: maxRowWidth,
+              height: totalH,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: outerMargin),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    SizedBox(
+                      width: tabW,
+                      height: dockSize,
+                      child: DecoratedBox(
+                        decoration: glassDeco(dockSize * 0.5),
+                        child: Stack(
+                          children: [
+                            Positioned(
+                              left: inset + slotW * _safeIndex,
+                              top: inset,
+                              width: slotW,
+                              height: lensH,
+                              child: DecoratedBox(
+                                decoration: BoxDecoration(
+                                  borderRadius:
+                                      BorderRadius.circular(lensH * 0.5),
+                                  color: Colors.white.withValues(alpha: 0.16),
+                                  border: Border.all(
+                                    color: Colors.white.withValues(alpha: 0.18),
+                                    width: 0.5,
+                                  ),
+                                ),
+                              ),
+                            ),
+                            Positioned.fill(
+                              child: Padding(
+                                padding: const EdgeInsets.all(inset),
+                                child: Row(
+                                  children: [
+                                    for (var i = 0; i < widget.items.length; i++)
+                                      Expanded(
+                                        child: Column(
+                                          mainAxisAlignment:
+                                              MainAxisAlignment.center,
+                                          children: [
+                                            Icon(
+                                              i == _safeIndex
+                                                  ? widget.items[i].$2
+                                                  : widget.items[i].$1,
+                                              size: 20.5,
+                                              color: i == _safeIndex
+                                                  ? Colors.white
+                                                  : Colors.white
+                                                      .withValues(alpha: 0.84),
+                                            ),
+                                            const SizedBox(height: 3),
+                                            Text(
+                                              widget.items[i].$3,
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: TextStyle(
+                                                fontSize: 10.5,
+                                                fontWeight: i == _safeIndex
+                                                    ? FontWeight.w600
+                                                    : FontWeight.w500,
+                                                color: i == _safeIndex
+                                                    ? Colors.white
+                                                    : Colors.white.withValues(
+                                                        alpha: 0.84,
+                                                      ),
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                    if (hasSearch) ...[
+                      const SizedBox(width: gap),
+                      SizedBox(
+                        width: dockSize,
+                        height: dockSize,
+                        child: DecoratedBox(
+                          decoration: glassDeco(dockSize * 0.5),
+                          child: const Center(
+                            child: Icon(
+                              CupertinoIcons.search,
+                              size: 22,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildCollapsedLogoButton(BuildContext context) {
+    const size = 62.0;
+    return Align(
+      key: const ValueKey('dock-collapsed-logo-wrap'),
+      alignment: Alignment.centerRight,
+      child: GestureDetector(
+        key: const ValueKey('dock-collapsed-logo-button'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _showFallbackCollapsedBubble(context),
+        child: RepaintBoundary(
+          child: LiquidGlass(
+            width: size,
+            height: size,
+            borderRadius: size * 0.5,
+            tint: const Color(0x56161414),
+            blur: 20,
+            saturation: 1.8,
+            child: const Center(
+              child: MarcoBrandLogo(
+                iconSize: 32,
+                showWordmark: false,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showFallbackCollapsedBubble(BuildContext context) async {
+    HapticFeedback.lightImpact();
+    final safeBottom = MediaQuery.paddingOf(context).bottom;
+    final dockBottom =
+        safeBottom > 0 ? math.max(safeBottom - 14.0, 10.0) : 12.0;
+    final bottomOffset = dockBottom + 62.0 + 12.0;
+    final chosen = await showGeneralDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      barrierLabel: '关闭快捷导航',
+      barrierColor: const Color(0x28000000),
+      transitionDuration: const Duration(milliseconds: 220),
+      pageBuilder: (dialogCtx, _, __) {
+        return Stack(
+          children: [
+            Positioned(
+              right: 16,
+              bottom: bottomOffset,
+              child: Material(
+                type: MaterialType.transparency,
+                child: LiquidGlass(
+                  key: const ValueKey('dock-collapsed-bubble-menu'),
+                  width: 176,
+                  borderRadius: 24,
+                  tint: const Color(0xA616161C),
+                  padding: const EdgeInsets.symmetric(vertical: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (widget.onSearch != null) ...[
+                        _bubbleMenuRow(
+                          icon: CupertinoIcons.search,
+                          label: '搜索影片',
+                          selected: false,
+                          onTap: () => Navigator.of(dialogCtx).pop('search'),
+                        ),
+                        const Divider(
+                          height: 1,
+                          thickness: 0.5,
+                          color: Color(0x26FFFFFF),
+                        ),
+                      ],
+                      for (var i = 0; i < widget.items.length; i++)
+                        _bubbleMenuRow(
+                          icon: i == _safeIndex
+                              ? widget.items[i].$2
+                              : widget.items[i].$1,
+                          label: widget.items[i].$3,
+                          selected: i == _safeIndex,
+                          onTap: () => Navigator.of(dialogCtx).pop('tab:$i'),
+                        ),
+                      if (widget.onScrollToTop != null) ...[
+                        const Divider(
+                          height: 1,
+                          thickness: 0.5,
+                          color: Color(0x26FFFFFF),
+                        ),
+                        _bubbleMenuRow(
+                          icon: CupertinoIcons.arrow_up_to_line,
+                          label: '回到顶部',
+                          selected: false,
+                          onTap: () => Navigator.of(dialogCtx).pop('top'),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+      transitionBuilder: (_, anim, __, child) {
+        final curved = CurvedAnimation(
+          parent: anim,
+          curve: Curves.easeOutBack,
+          reverseCurve: Curves.easeInCubic,
+        );
+        return FadeTransition(
+          opacity: curved,
+          child: ScaleTransition(
+            scale: Tween<double>(begin: 0.86, end: 1.0).animate(curved),
+            alignment: Alignment.bottomRight,
+            child: child,
+          ),
+        );
+      },
+    );
+    if (chosen == null) return;
+    if (chosen == 'search') {
+      widget.onSearch?.call();
+    } else if (chosen == 'top') {
+      widget.onScrollToTop?.call();
+    } else if (chosen.startsWith('tab:')) {
+      final idx = int.tryParse(chosen.substring(4));
+      if (idx != null) widget.onSelect(idx);
+    }
+  }
+
+  Widget _bubbleMenuRow({
+    required IconData icon,
+    required String label,
+    required bool selected,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: Row(
+          children: [
+            Icon(
+              icon,
+              size: 18,
+              color: selected ? Colors.white : const Color(0xD8F5F5F7),
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                label,
+                style: TextStyle(
+                  color: selected ? Colors.white : const Color(0xD8F5F5F7),
+                  fontSize: 14,
+                  fontWeight: selected ? FontWeight.w700 : FontWeight.w500,
+                ),
+              ),
+            ),
+            if (selected)
+              const Icon(
+                CupertinoIcons.checkmark_alt,
+                size: 15,
+                color: Colors.white,
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _shell({required Widget child, double? radius}) {
     return RepaintBoundary(
       child: LiquidGlass(
-        borderRadius: AppleLiquidGlassDock._dockRadius,
-        tint: const Color(0x52141418),
+        borderRadius: radius ?? AppleLiquidGlassDock._dockRadius,
+        tint: const Color(0x56161414),
         blur: 20,
         saturation: 1.8,
         child: child,
@@ -815,12 +1342,25 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
         final n = math.max(widget.items.length, 1);
         final available =
             constraints.maxWidth.isFinite ? constraints.maxWidth : 360.0;
-        // Shortened, compact iOS 27 pill length in portrait mode
-        final width = math.min(available * 0.82, 284.0).clamp(248.0, 288.0);
-        final itemW = (width - AppleLiquidGlassDock._pad * 2) / n;
+        final hasSearch = widget.onSearch != null;
+        const barH =
+            AppleLiquidGlassDock._itemH + AppleLiquidGlassDock._pad * 2;
+        final maxRowWidth = math.min(available, 420.0);
+        final pillWidth = hasSearch
+            ? math.max(
+                192.0,
+                math.min(
+                  maxRowWidth - barH - AppleLiquidGlassDock._searchGap,
+                  348.0,
+                ),
+              )
+            : math.min(maxRowWidth, 320.0).clamp(220.0, 320.0);
+        final itemW = (pillWidth - AppleLiquidGlassDock._pad * 2) / n;
         final isSliding = _dragLensSlot != null;
         final lensSlot = _dragLensSlot ?? _safeIndex.toDouble();
-        return _shell(
+
+        final pill = _shell(
+          radius: barH * 0.5,
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onHorizontalDragStart: (d) =>
@@ -830,9 +1370,8 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
             onHorizontalDragEnd: (_) => _endSlide(),
             onHorizontalDragCancel: () => _endSlide(cancelled: true),
             child: SizedBox(
-              width: width,
-              height:
-                  AppleLiquidGlassDock._itemH + AppleLiquidGlassDock._pad * 2,
+              width: pillWidth,
+              height: barH,
               child: Stack(
                 children: [
                   AnimatedPositioned(
@@ -870,6 +1409,20 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
             ),
           ),
         );
+
+        if (!hasSearch) return pill;
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            pill,
+            const SizedBox(width: AppleLiquidGlassDock._searchGap),
+            _DockSearchCircleButton(
+              size: barH,
+              onTap: widget.onSearch!,
+            ),
+          ],
+        );
       },
     );
   }
@@ -879,15 +1432,24 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
       builder: (context) {
         final n = math.max(widget.items.length, 1);
         final screenH = MediaQuery.sizeOf(context).height;
-        // Lengthened vertical dock in landscape mode
-        final targetTotalH = (screenH * 0.74).clamp(
-          AppleLiquidGlassDock._itemH * n + AppleLiquidGlassDock._pad * 2 + 44.0,
-          324.0,
+        final hasSearch = widget.onSearch != null;
+        const searchSize = 54.0;
+        final searchReserve = hasSearch ? (searchSize + 10.0) : 0.0;
+        final maxAvailableH = math.max(196.0, screenH - 28.0 - searchReserve);
+        final idealMin = math.min(
+          maxAvailableH,
+          AppleLiquidGlassDock._itemH * n + AppleLiquidGlassDock._pad * 2 + 12.0,
         );
+        final targetTotalH = (screenH * 0.72)
+            .clamp(idealMin, math.min(316.0, maxAvailableH))
+            .toDouble();
         final vItemH = (targetTotalH - AppleLiquidGlassDock._pad * 2) / n;
         final isSliding = _dragLensSlot != null;
         final lensSlot = _dragLensSlot ?? _safeIndex.toDouble();
-        return _shell(
+        const pillW =
+            AppleLiquidGlassDock._itemW + AppleLiquidGlassDock._pad * 2;
+        final pill = _shell(
+          radius: pillW * 0.5,
           child: GestureDetector(
             behavior: HitTestBehavior.opaque,
             onVerticalDragStart: (d) =>
@@ -897,8 +1459,7 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
             onVerticalDragEnd: (_) => _endSlide(),
             onVerticalDragCancel: () => _endSlide(cancelled: true),
             child: SizedBox(
-              width:
-                  AppleLiquidGlassDock._itemW + AppleLiquidGlassDock._pad * 2,
+              width: pillW,
               height: targetTotalH,
               child: Stack(
                 children: [
@@ -937,6 +1498,19 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
             ),
           ),
         );
+        if (!hasSearch) return pill;
+        return Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            pill,
+            const SizedBox(height: 10),
+            _DockSearchCircleButton(
+              size: searchSize,
+              onTap: widget.onSearch!,
+            ),
+          ],
+        );
       },
     );
   }
@@ -953,7 +1527,63 @@ class _AppleLiquidGlassDockState extends State<AppleLiquidGlassDock> {
   }
 }
 
-/// The lighter glass lens behind the selected tab (iOS 27 tab bar selection).
+/// Detached circular Liquid Glass search button paired beside the iOS 26 Dock.
+class _DockSearchCircleButton extends StatefulWidget {
+  final double size;
+  final VoidCallback onTap;
+
+  const _DockSearchCircleButton({
+    required this.size,
+    required this.onTap,
+  });
+
+  @override
+  State<_DockSearchCircleButton> createState() =>
+      _DockSearchCircleButtonState();
+}
+
+class _DockSearchCircleButtonState extends State<_DockSearchCircleButton> {
+  bool _pressed = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      key: const ValueKey('home-search-button'),
+      behavior: HitTestBehavior.opaque,
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapCancel: () => setState(() => _pressed = false),
+      onTapUp: (_) => setState(() => _pressed = false),
+      onTap: () {
+        HapticFeedback.lightImpact();
+        widget.onTap();
+      },
+      child: AnimatedScale(
+        scale: _pressed ? 0.90 : 1.0,
+        duration: const Duration(milliseconds: 160),
+        curve: Curves.easeOutCubic,
+        child: RepaintBoundary(
+          child: LiquidGlass(
+            width: widget.size,
+            height: widget.size,
+            borderRadius: widget.size * 0.5,
+            tint: const Color(0x56161414),
+            blur: 20,
+            saturation: 1.8,
+            child: const Center(
+              child: Icon(
+                CupertinoIcons.search,
+                size: 22,
+                color: Color(0xFFFFFFFF),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Dark translucent inner capsule lens behind the selected tab (iOS 26 style).
 class _DockSelectionLens extends StatelessWidget {
   const _DockSelectionLens();
   @override
@@ -963,19 +1593,17 @@ class _DockSelectionLens extends StatelessWidget {
           BorderRadius.circular(AppleLiquidGlassDock._lensRadius),
     );
     return CustomPaint(
-      foregroundPainter: _LiquidRimPainter(shape: shape, strength: 0.92),
+      foregroundPainter: _LiquidRimPainter(shape: shape, strength: 0.42),
       child: DecoratedBox(
         decoration: ShapeDecoration(
           shape: shape,
           gradient: const LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
             colors: [
-              Color(0x30FFFFFF),
-              Color(0x14FFFFFF),
-              Color(0x223E9BFF),
+              Color(0x66000000),
+              Color(0x4A000000),
             ],
-            stops: [0.0, 0.55, 1.0],
           ),
         ),
       ),
@@ -1008,7 +1636,7 @@ class _DockItemState extends State<_DockItem> {
     const duration = Duration(milliseconds: 240);
     final selected = widget.selected;
     final color =
-        selected ? const Color(0xFF3E9BFF) : const Color(0xE0F5F5F7);
+        selected ? const Color(0xFFFFFFFF) : const Color(0xD6F5F5F7);
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
       onTapDown: (_) => setState(() => _pressed = true),
@@ -1028,7 +1656,7 @@ class _DockItemState extends State<_DockItem> {
               curve: Curves.easeOut,
               builder: (context, value, _) => Icon(
                 selected ? widget.selectedIcon : widget.icon,
-                size: 22,
+                size: 21,
                 color: value ?? color,
               ),
             ),
@@ -1036,16 +1664,19 @@ class _DockItemState extends State<_DockItem> {
             AnimatedDefaultTextStyle(
               duration: duration,
               curve: Curves.easeOut,
-              style: TextStyle(
-                color: color,
-                fontSize: 10,
-                fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
-                letterSpacing: 0.1,
+              style: DefaultTextStyle.of(context).style.merge(
+                TextStyle(
+                  color: color,
+                  fontSize: 10,
+                  fontWeight: selected ? FontWeight.w600 : FontWeight.w500,
+                  letterSpacing: 0.1,
+                ),
               ),
               child: Text(
                 widget.label,
                 maxLines: 1,
                 overflow: TextOverflow.clip,
+                textScaler: TextScaler.noScaling,
               ),
             ),
           ],
@@ -1289,6 +1920,7 @@ class AppleCapsuleButton extends StatelessWidget {
   final bool primary;
   final bool destructive;
   final bool compact;
+  final bool useBackdrop;
   const AppleCapsuleButton({
     super.key,
     required this.label,
@@ -1297,6 +1929,7 @@ class AppleCapsuleButton extends StatelessWidget {
     this.primary = false,
     this.destructive = false,
     this.compact = false,
+    this.useBackdrop = true,
   });
   @override
   Widget build(BuildContext context) {
@@ -1388,7 +2021,7 @@ class AppleCapsuleButton extends StatelessWidget {
           child: labelRow,
         ),
       );
-      buttonBody = _isWindowsDesktop
+      buttonBody = (_isWindowsDesktop || !useBackdrop)
           ? surface
           : GlassworkBackdrop(radius: 999, child: surface);
     }
@@ -1752,62 +2385,81 @@ Future<T?> showAppleModalSheet<T>({
                 maxWidth: effectiveMaxWidth,
                 maxHeight: screenSize.height * 0.88,
               ),
-              child: LiquidGlass(
-                borderRadius: 28,
-                rimStrength: 1.0,
-                child: Material(
-                  color: Colors.transparent,
-                  child: SafeArea(
-                    top: false,
-                    left: false,
-                    right: false,
-                    bottom: !isLandscape && !ignoreKeyboardInsets,
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        const SizedBox(height: 9),
-                        Container(
-                          width: 40,
-                          height: 4.5,
-                          decoration: BoxDecoration(
-                            color: const Color(0x66EBEBF5),
-                            borderRadius: BorderRadius.circular(999),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(28),
+                clipBehavior: Clip.antiAlias,
+                child: Stack(
+                  children: [
+                    const Positioned.fill(
+                      child: IgnorePointer(
+                        child: RepaintBoundary(
+                          child: LiquidGlass(
+                            borderRadius: 28,
+                            rimStrength: 1.0,
+                            child: SizedBox.expand(),
                           ),
                         ),
-                        Padding(
-                          padding: const EdgeInsets.fromLTRB(20, 10, 12, 10),
-                          child: Row(
+                      ),
+                    ),
+                    RepaintBoundary(
+                      child: Material(
+                        color: Colors.transparent,
+                        child: SafeArea(
+                          top: false,
+                          left: false,
+                          right: false,
+                          bottom: !isLandscape && !ignoreKeyboardInsets,
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
                             children: [
-                              Expanded(
-                                child: Text(
-                                  title,
-                                  style: const TextStyle(
-                                    color: AppleColors.labelPrimary,
-                                    fontSize: 17.5,
-                                    fontWeight: FontWeight.w700,
-                                    letterSpacing: -0.35,
-                                  ),
+                              const SizedBox(height: 9),
+                              Container(
+                                width: 40,
+                                height: 4.5,
+                                decoration: BoxDecoration(
+                                  color: const Color(0x66EBEBF5),
+                                  borderRadius: BorderRadius.circular(999),
                                 ),
                               ),
-                              if (trailingAction != null) trailingAction,
-                              CupertinoButton(
-                                padding: const EdgeInsets.all(6),
-                                minSize: 30,
-                                onPressed: () => Navigator.of(ctx).pop(),
-                                child: const Icon(
-                                  CupertinoIcons.xmark_circle_fill,
-                                  color: AppleColors.labelTertiary,
-                                  size: 26,
+                              Padding(
+                                padding: const EdgeInsets.fromLTRB(20, 10, 12, 10),
+                                child: Row(
+                                  children: [
+                                    Expanded(
+                                      child: Text(
+                                        title,
+                                        style: const TextStyle(
+                                          color: AppleColors.labelPrimary,
+                                          fontSize: 17.5,
+                                          fontWeight: FontWeight.w700,
+                                          letterSpacing: -0.35,
+                                        ),
+                                      ),
+                                    ),
+                                    if (trailingAction != null) trailingAction,
+                                    CupertinoButton(
+                                      padding: const EdgeInsets.all(6),
+                                      minSize: 30,
+                                      onPressed: () => Navigator.of(ctx).pop(),
+                                      child: const Icon(
+                                        CupertinoIcons.xmark_circle_fill,
+                                        color: AppleColors.labelTertiary,
+                                        size: 26,
+                                      ),
+                                    ),
+                                  ],
                                 ),
+                              ),
+                              Container(height: 0.5, color: const Color(0x22FFFFFF)),
+                              Flexible(
+                                child: TextSelectionMouseGuard(child: builder(ctx)),
                               ),
                             ],
                           ),
                         ),
-                        Container(height: 0.5, color: const Color(0x22FFFFFF)),
-                        Flexible(child: TextSelectionMouseGuard(child: builder(ctx))),
-                      ],
+                      ),
                     ),
-                  ),
+                  ],
                 ),
               ),
             ),
@@ -1855,7 +2507,11 @@ class _AppleAmbientBackgroundState extends State<AppleAmbientBackground>
     with SingleTickerProviderStateMixin {
   late final AnimationController _breathController;
 
+  bool get _useAuroraShader =>
+      widget.preset == 'aurora' && !OhosRuntime.isOhos && !_isWindowsDesktop;
+
   bool get _shouldAnimate {
+    if (_useAuroraShader) return false;
     if (!widget.animate || !widget.showAmbientArtwork) return false;
     if (_isWindowsDesktop) return false;
     if (!kIsWeb && Platform.environment.containsKey('FLUTTER_TEST')) {
@@ -1942,16 +2598,27 @@ class _AppleAmbientBackgroundState extends State<AppleAmbientBackground>
       child: Stack(
         fit: StackFit.expand,
         children: [
-          DecoratedBox(
-            decoration: BoxDecoration(
-              gradient: LinearGradient(
-                begin: Alignment.topCenter,
-                end: Alignment.bottomCenter,
-                colors: gradientColors,
-                stops: const [0.0, 0.38, 0.82],
+          if (_useAuroraShader)
+            Positioned.fill(
+              child: AuroraBackground(
+                key: const Key('apple-ambient-aurora'),
+                active: widget.animate && widget.showAmbientArtwork,
+                strength: widget.showAmbientArtwork
+                    ? MotionTokens.auroraDefaultStrength
+                    : 0.28,
+              ),
+            )
+          else
+            DecoratedBox(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.topCenter,
+                  end: Alignment.bottomCenter,
+                  colors: gradientColors,
+                  stops: const [0.0, 0.38, 0.82],
+                ),
               ),
             ),
-          ),
         if (widget.customWallpaper != null)
           Positioned.fill(
             child: IgnorePointer(
@@ -2048,7 +2715,8 @@ class _AppleAmbientBackgroundState extends State<AppleAmbientBackground>
               ),
             ),
           ),
-        Positioned.fill(
+        if (!_useAuroraShader)
+          Positioned.fill(
           child: IgnorePointer(
             child: AnimatedBuilder(
               animation: _breathController,
@@ -2118,6 +2786,7 @@ class AppleSearchField extends StatefulWidget {
   final FocusNode? focusNode;
   final String placeholder;
   final bool autofocus;
+  final bool borderless;
   final ValueChanged<String>? onChanged;
   final ValueChanged<String>? onSubmitted;
   final VoidCallback? onSuffixTap;
@@ -2128,6 +2797,7 @@ class AppleSearchField extends StatefulWidget {
     this.focusNode,
     this.placeholder = '搜索',
     this.autofocus = false,
+    this.borderless = false,
     this.onChanged,
     this.onSubmitted,
     this.onSuffixTap,
@@ -2225,16 +2895,20 @@ class _AppleSearchFieldState extends State<AppleSearchField> {
       behavior: HitTestBehavior.translucent,
       onTap: () => _effectiveFocusNode.requestFocus(),
       child: Container(
-        constraints: const BoxConstraints(minHeight: 38),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
-        decoration: BoxDecoration(
-          color: const Color(0x40787884),
-          borderRadius: BorderRadius.circular(11),
-          border: Border.all(
-            color: const Color(0x24FFFFFF),
-            width: 0.65,
-          ),
-        ),
+        constraints: BoxConstraints(minHeight: widget.borderless ? 36 : 38),
+        padding: widget.borderless
+            ? const EdgeInsets.symmetric(horizontal: 4, vertical: 0)
+            : const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+        decoration: widget.borderless
+            ? null
+            : BoxDecoration(
+                color: const Color(0x40787884),
+                borderRadius: BorderRadius.circular(11),
+                border: Border.all(
+                  color: const Color(0x24FFFFFF),
+                  width: 0.65,
+                ),
+              ),
         child: Row(
           children: [
             const Icon(

@@ -55,7 +55,8 @@ public final class MainActivity extends Activity {
     GlobalSearchScreen searchScreen;
     Dialog sourceDialog, accountDialog;
     MagnetStream magnetStream;
-    static volatile PhoneticSearchIndex sharedPhonetic;
+    // Assets only. Never publish an Activity's learned/private index into this template.
+    private static volatile PhoneticSearchIndex sharedPhoneticDictionary;
     volatile PhoneticSearchIndex phonetic;
     final CountDownLatch phoneticReady = new CountDownLatch(1);
     ConfigStore configStore;
@@ -67,6 +68,7 @@ public final class MainActivity extends Activity {
     LocalProxy localProxy;
     WebResolver webResolver;
     PlaybackControls playbackControls;
+    TvMarkerHost markerHost;
     Cms.Line activeLine;
     Cms.Episode activeEpisode;
     int resumeAt;
@@ -81,6 +83,229 @@ public final class MainActivity extends Activity {
             };
     final HomeKeyTracker homeKeys = new HomeKeyTracker();
     Screen shortcutScreen;
+
+    static final class GlassFreezeController implements PlayerTransitionHelper.GlassFreezeCallback {
+        private static final class DeferredFrame {
+            final GlassFreezeFrameLayout host;
+            final Runnable ready;
+
+            DeferredFrame(GlassFreezeFrameLayout host, Runnable ready) {
+                this.host = host;
+                this.ready = ready;
+            }
+        }
+
+        private int freezeDepth;
+        private final Runnable onUnfreeze;
+        private final List<DeferredFrame> deferredFrames = new ArrayList<>();
+
+        GlassFreezeController(Runnable onUnfreeze) {
+            this.onUnfreeze = onUnfreeze;
+        }
+
+        @Override
+        public void setGlassFrozen(boolean frozen) {
+            List<DeferredFrame> toResume = null;
+            boolean unfroze = false;
+            synchronized (this) {
+                if (frozen) {
+                    freezeDepth++;
+                } else if (freezeDepth > 0) {
+                    freezeDepth--;
+                    if (freezeDepth == 0) {
+                        unfroze = true;
+                        if (!deferredFrames.isEmpty()) {
+                            toResume = new ArrayList<>(deferredFrames);
+                            deferredFrames.clear();
+                        }
+                    }
+                }
+            }
+            if (unfroze) {
+                if (onUnfreeze != null) {
+                    onUnfreeze.run();
+                }
+                resumeDeferred(toResume);
+            }
+        }
+
+        void forceUnfreeze() {
+            List<DeferredFrame> toResume = null;
+            boolean unfroze = false;
+            synchronized (this) {
+                if (freezeDepth > 0) {
+                    freezeDepth = 0;
+                    unfroze = true;
+                    if (!deferredFrames.isEmpty()) {
+                        toResume = new ArrayList<>(deferredFrames);
+                        deferredFrames.clear();
+                    }
+                }
+            }
+            if (unfroze) {
+                if (onUnfreeze != null) {
+                    onUnfreeze.run();
+                }
+                resumeDeferred(toResume);
+            }
+        }
+
+        synchronized boolean isFrozen() {
+            return freezeDepth > 0;
+        }
+
+        /**
+         * Preserves real user {@code Prefs.REDUCED_TRANSPARENCY} without forcing frozen glass
+         * surfaces to snap from their cached blurred {@code material} bitmaps to solid {@code
+         * DARK_TINT}. Backdrop resampling is intercepted via {@link GlassFreezeFrameLayout}
+         * ({@link com.pilipala.glass.GlassworkSurface.FrameSource}).
+         */
+        boolean shouldReduceTransparency(boolean userReducedTransparency) {
+            return userReducedTransparency;
+        }
+
+        boolean deferCaptureIfFrozen(GlassFreezeFrameLayout host, Runnable ready) {
+            if (ready == null) return false;
+            synchronized (this) {
+                if (freezeDepth <= 0) {
+                    return false;
+                }
+                deferredFrames.add(new DeferredFrame(host, ready));
+                return true;
+            }
+        }
+
+        synchronized void clearDeferredForHost(GlassFreezeFrameLayout host) {
+            for (int i = deferredFrames.size() - 1; i >= 0; i--) {
+                if (deferredFrames.get(i).host == host) {
+                    deferredFrames.remove(i);
+                }
+            }
+        }
+
+        synchronized int getDeferredCaptureCount() {
+            return deferredFrames.size();
+        }
+
+        private void resumeDeferred(List<DeferredFrame> toResume) {
+            if (toResume == null) return;
+            for (int i = 0; i < toResume.size(); i++) {
+                DeferredFrame item = toResume.get(i);
+                if (isFrozen()) {
+                    synchronized (this) {
+                        for (int j = i; j < toResume.size(); j++) {
+                            deferredFrames.add(toResume.get(j));
+                        }
+                    }
+                    return;
+                }
+                item.host.dispatchUnfrozenFrame(item.ready);
+            }
+        }
+    }
+
+    /**
+     * Root backdrop container implementing {@link com.pilipala.glass.GlassworkSurface.FrameSource}
+     * so transitions freeze backdrop resampling before bitmap capture/blur while keeping existing
+     * cached {@code material} bitmaps rendered smoothly on every child view (including independent
+     * API 23+ hardware DisplayLists) and keeping {@code target.getBackground() instanceof
+     * GlassworkSurface} intact.
+     */
+    static class GlassFreezeFrameLayout extends FrameLayout
+            implements com.pilipala.glass.GlassworkSurface.FrameSource {
+        private final GlassFreezeController freezeController;
+
+        GlassFreezeFrameLayout(Context context, GlassFreezeController freezeController) {
+            super(context);
+            this.freezeController = freezeController;
+        }
+
+        @Override
+        public void prepareGlassFrame(Runnable ready) {
+            if (ready == null) return;
+            if (freezeController != null && freezeController.deferCaptureIfFrozen(this, ready)) {
+                return;
+            }
+            dispatchUnfrozenFrame(ready);
+        }
+
+        @Override
+        public boolean glassFrameAdvancing() {
+            if (freezeController != null && freezeController.isFrozen()) {
+                return false;
+            }
+            com.pilipala.glass.GlassworkSurface.FrameSource child = findDescendantFrameSource(this);
+            return child != null && child.glassFrameAdvancing();
+        }
+
+        void dispatchUnfrozenFrame(Runnable ready) {
+            if (ready == null) return;
+            com.pilipala.glass.GlassworkSurface.FrameSource child = findDescendantFrameSource(this);
+            if (child != null) {
+                child.prepareGlassFrame(ready);
+            } else {
+                ready.run();
+            }
+        }
+
+        @Override
+        protected void onDetachedFromWindow() {
+            if (freezeController != null) {
+                freezeController.clearDeferredForHost(this);
+            }
+            super.onDetachedFromWindow();
+        }
+
+        private static com.pilipala.glass.GlassworkSurface.FrameSource findDescendantFrameSource(
+                ViewGroup group) {
+            if (group == null) return null;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                com.pilipala.glass.GlassworkSurface.FrameSource found =
+                        findFrameSourceInSubtree(group.getChildAt(i));
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        private static com.pilipala.glass.GlassworkSurface.FrameSource findFrameSourceInSubtree(
+                View view) {
+            if (view == null || view.getVisibility() != View.VISIBLE) return null;
+            if (view instanceof com.pilipala.glass.GlassworkSurface.FrameSource) {
+                return (com.pilipala.glass.GlassworkSurface.FrameSource) view;
+            }
+            if (view instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) view;
+                for (int i = 0; i < vg.getChildCount(); i++) {
+                    com.pilipala.glass.GlassworkSurface.FrameSource found =
+                            findFrameSourceInSubtree(vg.getChildAt(i));
+                    if (found != null) return found;
+                }
+            }
+            return null;
+        }
+    }
+
+    FrameLayout newGlassBackdropRoot() {
+        return new GlassFreezeFrameLayout(this, glassFreezeController);
+    }
+
+    final GlassFreezeController glassFreezeController =
+            new GlassFreezeController(this::invalidateGlassBackdrop);
+
+    private void invalidateGlassBackdrop() {
+        if (root != null) {
+            com.pilipala.glass.GlassworkSurface.invalidateBackdrop(root);
+        }
+    }
+
+    Rect pendingDetailOrigin;
+    PlayerTransitionHelper.TransitionHandle activeTransition;
+    boolean pendingPlayerTransition;
+    int transitionSerial;
+    OnboardingScreen activeOnboarding;
+    AuroraSurfaceView onboardingAurora;
+    final Map<ViewGroup, Integer> savedOnboardingFocusability = new IdentityHashMap<>();
+    final Map<View, Boolean> savedOnboardingViewFocusable = new IdentityHashMap<>();
     StartupIntro startupIntro;
     boolean introSkipKey;
     HomeAmbient homeAmbient;
@@ -452,7 +677,14 @@ public final class MainActivity extends Activity {
     }
 
     boolean useTopDock() {
-        return isTvDevice() && prefs.getInt(Prefs.TV_DOCK_POSITION, 0) == 1;
+        return isTvDevice() && !useLeftDock() && prefs.getInt(Prefs.TV_DOCK_POSITION, 0) == 1;
+    }
+
+    boolean useLeftDock() {
+        return Prefs.useTvLeftDock(
+                isTvDevice(),
+                prefs.contains(Prefs.TV_DOCK_POSITION),
+                prefs.getInt(Prefs.TV_NAVIGATION_MODE, -1));
     }
 
     void applyMobileSystemBars(boolean fullscreenPlayer) {
@@ -617,41 +849,9 @@ public final class MainActivity extends Activity {
         }
         // Phone / tablet only: restore the offline download queue (never started on TV).
         if (!isTvDevice()) DownloadManager.get(this);
-        if (sharedPhonetic != null) {
-            phonetic = sharedPhonetic;
-            phoneticReady.countDown();
-        } else {
-            worker.execute(
-                    () -> {
-                        try {
-                            PhoneticSearchIndex index =
-                                    new PhoneticSearchIndex(
-                                            getAssets().open("search/pinyin-characters.tsv"),
-                                            getAssets().open("search/pinyin-phrases.dict.yaml"),
-                                            getAssets().open("search/title-phrases.txt"));
-                            try {
-                                org.json.JSONArray old =
-                                        new org.json.JSONArray(
-                                                prefs.getString(Prefs.PHONETIC_TITLES, "[]"));
-                                for (int i = 0; i < old.length(); i++)
-                                    index.learn(old.optString(i));
-                                org.json.JSONArray history =
-                                        new org.json.JSONArray(
-                                                prefs.getString(Prefs.GLOBAL_SEARCH_HISTORY, "[]"));
-                                for (int i = history.length() - 1; i >= 0; i--)
-                                    index.prefer(history.optString(i));
-                            } catch (Throwable ignored) {
-                            }
-                            sharedPhonetic = index;
-                            phonetic = index;
-                        } catch (Throwable ignored) {
-                        } finally {
-                            phoneticReady.countDown();
-                        }
-                    });
-        }
+        initializePhonetic();
         layoutIntro = b == null || b.getBoolean("layout_initial_launch", false);
-        root = new FrameLayout(this);
+        root = newGlassBackdropRoot();
         root.setBackgroundColor(DARK);
         setContentView(root);
         root.addOnLayoutChangeListener(
@@ -726,6 +926,9 @@ public final class MainActivity extends Activity {
                                     }
                                     if (recoveredFromCrash) {
                                         toast("上次加载该片源时异常退出，已自动重置片源选择");
+                                    } else if (!privateMode
+                                            && OnboardingScreen.shouldShow(MainActivity.this)) {
+                                        showOnboarding(false);
                                     } else if (layoutIntro && isTvDevice()) {
                                         StartupIntro.show(MainActivity.this);
                                     }
@@ -803,7 +1006,12 @@ public final class MainActivity extends Activity {
 
     void glass(View view, float radius) {
         com.pilipala.glass.GlassworkSurface.attach(
-                view, root, dp(radius), () -> prefs.getBoolean(Prefs.REDUCED_TRANSPARENCY, false));
+                view,
+                root,
+                dp(radius),
+                () ->
+                        glassFreezeController.shouldReduceTransparency(
+                                prefs.getBoolean(Prefs.REDUCED_TRANSPARENCY, false)));
     }
 
     GradientDrawable bg(int color, float radius) {
@@ -974,6 +1182,8 @@ public final class MainActivity extends Activity {
     }
 
     void preparePage(boolean navigation) {
+        cancelActiveTransition();
+        dismissOnboarding();
         clearPlaybackLoading();
         cancelArtwork();
         cancelPageRequests();
@@ -994,19 +1204,25 @@ public final class MainActivity extends Activity {
 
     void renderPage(String title, String eyebrow, boolean navigation) {
         preparePage(navigation);
-        root = new FrameLayout(this);
+        root = newGlassBackdropRoot();
         root.setClipChildren(false);
         root.setClipToPadding(false);
         root.setBackgroundColor(DARK);
         root.addView(ImageLoader.createAtmosphere(this), new FrameLayout.LayoutParams(-1, -1));
         homeAmbient = null;
-        if (navigation
-                && prefs.getBoolean(Prefs.HOME_AMBIENT, true)
-                && !prefs.getBoolean(Prefs.WALLPAPER_ENABLED, false)) {
+        int tvBgMode = HomeAmbient.effectiveBgMode(this);
+        boolean wantAmbient =
+                isTvDevice()
+                        ? (tvBgMode == Prefs.BG_MODE_ADAPTIVE || tvBgMode == Prefs.BG_MODE_GRADIENT)
+                        : (navigation
+                                && prefs.getBoolean(Prefs.HOME_AMBIENT, true)
+                                && !prefs.getBoolean(Prefs.WALLPAPER_ENABLED, false));
+        if (wantAmbient) {
             homeAmbient = new HomeAmbient(this);
             root.addView(homeAmbient, new FrameLayout.LayoutParams(-1, -1));
         }
-        if (navigation) root.addView(homeGradient(), new FrameLayout.LayoutParams(-1, -1));
+        if (navigation || isTvDevice())
+            root.addView(homeGradient(), new FrameLayout.LayoutParams(-1, -1));
         scroll = new TvScrollView(this);
         scroll.setClipChildren(false);
         scroll.setClipToPadding(false);
@@ -1030,45 +1246,60 @@ public final class MainActivity extends Activity {
                 body.setPadding(dp(18), statusBarHeight() + dp(14), dp(18), dp(86));
             } else if (useTopDock()) {
                 body.setPadding(dp(34), dp(18), dp(34), dp(36));
+            } else if (useLeftDock()) {
+                int left =
+                        Math.max(
+                                80,
+                                Math.round(
+                                                56
+                                                        * Prefs.clampNavScale(
+                                                                prefs.getInt(
+                                                                        Prefs.NAV_SCALE_PERCENT,
+                                                                        100))
+                                                        / 100f)
+                                        + 30);
+                body.setPadding(dp(left), dp(18), dp(34), dp(36));
             } else {
                 body.setPadding(dp(34), dp(18), dp(100), dp(36));
             }
             homeDock = new HomeDock(this);
-            LinearLayout brandRow = row();
-            brandRow.setTag("home-brand");
-            brandRow.setGravity(Gravity.CENTER_VERTICAL);
-            ImageView brandMark = new ImageView(this);
-            brandMark.setImageResource(R.drawable.logo_mark);
-            LinearLayout.LayoutParams brandSize = new LinearLayout.LayoutParams(dp(30), dp(30));
-            brandSize.rightMargin = dp(10);
-            brandRow.addView(brandMark, brandSize);
-            TextView brand = text("MARCO MOVIE", 14, WHITE);
-            brand.setIncludeFontPadding(false);
-            brand.setSingleLine(true);
-            brand.setLetterSpacing(.10f);
-            brand.setTypeface(null, Typeface.BOLD);
-            brandRow.addView(brand);
-            if (homeDock.topMode) {
-                int dockLeftPx = Math.max(0, (windowWidth() - dp(homeDock.mainDp)) / 2);
-                int maxBrandWidth = dockLeftPx - dp(34 + 14);
-                if (maxBrandWidth < dp(90)) {
-                    brand.setVisibility(View.GONE);
+            if (!homeDock.tvLeft) {
+                LinearLayout brandRow = row();
+                brandRow.setTag("home-brand");
+                brandRow.setGravity(Gravity.CENTER_VERTICAL);
+                ImageView brandMark = new ImageView(this);
+                brandMark.setImageResource(R.drawable.logo_mark);
+                LinearLayout.LayoutParams brandSize = new LinearLayout.LayoutParams(dp(30), dp(30));
+                brandSize.rightMargin = dp(10);
+                brandRow.addView(brandMark, brandSize);
+                TextView brand = text("MARCO MOVIE", 14, WHITE);
+                brand.setIncludeFontPadding(false);
+                brand.setSingleLine(true);
+                brand.setLetterSpacing(.10f);
+                brand.setTypeface(null, Typeface.BOLD);
+                brandRow.addView(brand);
+                if (homeDock.topMode) {
+                    int dockLeftPx = Math.max(0, (windowWidth() - dp(homeDock.mainDp)) / 2);
+                    int maxBrandWidth = dockLeftPx - dp(34 + 14);
+                    if (maxBrandWidth < dp(90)) {
+                        brand.setVisibility(View.GONE);
+                    } else {
+                        brand.setMaxWidth(Math.max(dp(50), maxBrandWidth - dp(40)));
+                        brand.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                    }
+                    FrameLayout.LayoutParams brandLayout =
+                            new FrameLayout.LayoutParams(
+                                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                                    dp(homeDock.crossDp),
+                                    Gravity.LEFT | Gravity.TOP);
+                    brandLayout.leftMargin = dp(34);
+                    brandLayout.topMargin = dp(16);
+                    root.addView(brandRow, brandLayout);
+                    if (!title.isEmpty()) gap(body, 14);
                 } else {
-                    brand.setMaxWidth(Math.max(dp(50), maxBrandWidth - dp(40)));
-                    brand.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                    body.addView(brandRow);
+                    gap(body, title.isEmpty() ? 14 : 22);
                 }
-                FrameLayout.LayoutParams brandLayout =
-                        new FrameLayout.LayoutParams(
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
-                                dp(homeDock.crossDp),
-                                Gravity.LEFT | Gravity.TOP);
-                brandLayout.leftMargin = dp(34);
-                brandLayout.topMargin = dp(16);
-                root.addView(brandRow, brandLayout);
-                if (!title.isEmpty()) gap(body, 14);
-            } else {
-                body.addView(brandRow);
-                gap(body, title.isEmpty() ? 14 : 22);
             }
         }
         if (!title.isEmpty()) {
@@ -1096,14 +1327,23 @@ public final class MainActivity extends Activity {
      * side shading. Sits above the poster colors or wallpaper and below all content.
      */
     View homeGradient() {
+        boolean glowActive = homeAmbient != null && homeAmbient.getVisibility() == View.VISIBLE;
         GradientDrawable vertical =
                 new GradientDrawable(
                         GradientDrawable.Orientation.TOP_BOTTOM,
-                        new int[] {0x3a3b5a80, 0x0d1a2233, 0x00101013, 0x8c0a0a0d, 0xe60a0a0d});
+                        glowActive
+                                ? new int[] {
+                                    0x10000000, 0x00000000, 0x08060910, 0x22060910, 0x48060910
+                                }
+                                : new int[] {
+                                    0x1c000000, 0x00000000, 0x18080a0f, 0x66080a0f, 0xb8080a0f
+                                });
         GradientDrawable sides =
                 new GradientDrawable(
                         GradientDrawable.Orientation.LEFT_RIGHT,
-                        new int[] {0x47000000, 0x00000000, 0x00000000, 0x38000000});
+                        glowActive
+                                ? new int[] {0x22000000, 0x00000000, 0x00000000, 0x14000000}
+                                : new int[] {0x38000000, 0x00000000, 0x00000000, 0x26000000});
         View scrim = new View(this);
         scrim.setTag("home-gradient");
         scrim.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
@@ -1131,12 +1371,446 @@ public final class MainActivity extends Activity {
         SourceController.closeEngines(this);
     }
 
-    void open(Screen s, boolean history) {
+    void capturePendingDetailOrigin(View sourceCard) {
+        if (isTvDevice()
+                || reduced
+                || root == null
+                || sourceCard == null
+                || sourceCard.getWidth() <= 0
+                || sourceCard.getHeight() <= 0) {
+            pendingDetailOrigin = null;
+            return;
+        }
+        Rect rect = new Rect();
+        PlayerTransitionHelper.resolveDescendantRectInRoot(root, sourceCard, rect);
+        pendingDetailOrigin = rect.width() > 0 && rect.height() > 0 ? rect : null;
+    }
+
+    Rect consumePendingDetailOrigin() {
+        Rect rect = pendingDetailOrigin;
+        pendingDetailOrigin = null;
+        return rect;
+    }
+
+    void cancelActiveTransition() {
+        transitionSerial++;
+        pendingPlayerTransition = false;
+        PlayerTransitionHelper.TransitionHandle handle = activeTransition;
+        activeTransition = null;
+        if (handle != null) {
+            handle.cancel();
+        }
+        glassFreezeController.forceUnfreeze();
+    }
+
+    static final class DetailPortalSelection {
+        final View ambientPosterView;
+        final View portalCardView;
+        final RectF posterOriginPx;
+        final Bitmap posterBitmap;
+
+        DetailPortalSelection(
+                View ambientPosterView,
+                View portalCardView,
+                RectF posterOriginPx,
+                Bitmap posterBitmap) {
+            this.ambientPosterView = ambientPosterView;
+            this.portalCardView = portalCardView;
+            this.posterOriginPx = posterOriginPx;
+            this.posterBitmap = posterBitmap;
+        }
+    }
+
+    private static boolean isIndependentPosterCardCandidate(View view) {
+        if (view == null
+                || view.getVisibility() != View.VISIBLE
+                || view.getWidth() <= 0
+                || view.getHeight() <= 0) {
+            return false;
+        }
+        if (view instanceof MobileDetailScreen.PortraitBackdropView
+                || view instanceof MobileDetailScreen.PosterHookImageView
+                || view instanceof ImmersivePoster.Backdrop) {
+            return false;
+        }
+        if (view instanceof ImmersivePoster && ((ImmersivePoster) view).immersiveMode) {
+            return false;
+        }
+        return true;
+    }
+
+    static DetailPortalSelection resolveDetailPortalSelection(View detailLayer) {
+        if (detailLayer == null) {
+            return new DetailPortalSelection(null, null, new RectF(0f, 0f, 0f, 0f), null);
+        }
+        View explicitCard = detailLayer.findViewWithTag("detail-poster-card");
+        View coverView = detailLayer.findViewWithTag("detail-cover");
+        View backdropView = detailLayer.findViewWithTag("detail-backdrop");
+
+        View ambientPosterView = null;
+        if (isIndependentPosterCardCandidate(explicitCard)) {
+            ambientPosterView = explicitCard;
+        } else if (backdropView != null
+                && backdropView.getVisibility() == View.VISIBLE
+                && backdropView.getWidth() > 0
+                && backdropView.getHeight() > 0) {
+            ambientPosterView = backdropView;
+        } else if (isIndependentPosterCardCandidate(coverView)) {
+            ambientPosterView = coverView;
+        }
+
+        View portalCard = null;
+        if (isIndependentPosterCardCandidate(explicitCard)) {
+            portalCard = explicitCard;
+        } else if (isIndependentPosterCardCandidate(coverView)) {
+            portalCard = coverView;
+        }
+
+        RectF originPx = new RectF(0f, 0f, 0f, 0f);
+        Bitmap posterBitmap = null;
+        if (portalCard != null) {
+            Rect cardRect = new Rect();
+            PlayerTransitionHelper.resolveDescendantRectInRoot(detailLayer, portalCard, cardRect);
+            RectF candidateRect = new RectF(cardRect);
+            if (PlayerTransitionHelper.isBoundedPosterCardRect(
+                    candidateRect, detailLayer.getWidth(), detailLayer.getHeight())) {
+                Bitmap extracted = extractDetailPosterBitmap(portalCard);
+                if (extracted != null && !extracted.isRecycled()) {
+                    originPx = candidateRect;
+                    posterBitmap = extracted;
+                }
+            } else {
+                portalCard = null;
+            }
+        }
+        return new DetailPortalSelection(ambientPosterView, portalCard, originPx, posterBitmap);
+    }
+
+    static Bitmap extractDetailPosterBitmap(View posterView) {
+        if (posterView instanceof MobileDetailScreen.PortraitBackdropView) {
+            Bitmap bmp = ((MobileDetailScreen.PortraitBackdropView) posterView).getPosterBitmap();
+            return (bmp != null && !bmp.isRecycled()) ? bmp : null;
+        }
+        if (posterView instanceof ImmersivePoster.Backdrop) {
+            ImmersivePoster.Backdrop b = (ImmersivePoster.Backdrop) posterView;
+            if (b.wideBitmap != null && !b.wideBitmap.isRecycled()) return b.wideBitmap;
+            if (b.rawBitmap != null && !b.rawBitmap.isRecycled()) return b.rawBitmap;
+        }
+        if (posterView instanceof ImmersivePoster) {
+            ImmersivePoster ip = (ImmersivePoster) posterView;
+            Bitmap fromImage = extractImageViewBitmap(ip.image);
+            if (fromImage != null) return fromImage;
+            if (ip.backdrop != null
+                    && ip.backdrop.rawBitmap != null
+                    && !ip.backdrop.rawBitmap.isRecycled()) {
+                return ip.backdrop.rawBitmap;
+            }
+            return null;
+        }
+        if (posterView instanceof ImageView) {
+            return extractImageViewBitmap((ImageView) posterView);
+        }
+        return null;
+    }
+
+    private static Bitmap extractImageViewBitmap(ImageView imageView) {
+        if (imageView == null) return null;
+        Drawable d = imageView.getDrawable();
+        if (d instanceof BitmapDrawable) {
+            Bitmap bmp = ((BitmapDrawable) d).getBitmap();
+            return (bmp != null && !bmp.isRecycled()) ? bmp : null;
+        }
+        return null;
+    }
+
+    void openScreenNow(Screen s, boolean history) {
         capture();
         if (history && current != null) back.push(current);
         current = s;
         s.render.run();
         restore(s);
+    }
+
+    void open(Screen s, boolean history) {
+        dismissOnboarding();
+        cancelActiveTransition();
+        boolean detailToPlayer =
+                s != null
+                        && s.player
+                        && current != null
+                        && !current.player
+                        && !miniMode
+                        && layoutReady
+                        && root != null
+                        && root.getWidth() > 0
+                        && root.getHeight() > 0;
+        if (!detailToPlayer) {
+            openScreenNow(s, history);
+            return;
+        }
+
+        final View detailLayer = root;
+        DetailPortalSelection portal = resolveDetailPortalSelection(detailLayer);
+        RectF posterOriginPx = portal.posterOriginPx;
+        float posterRadiusPx = portal.posterBitmap != null ? dp(16) : 0f;
+        Rect safeInsetsPx = new Rect(0, statusBarHeight(), 0, navigationBarHeight());
+
+        if (Build.VERSION.SDK_INT >= 33 && !isTvDevice() && !reduced) {
+            Bitmap backdrop = PlayerTransitionHelper.captureDownsampledBackdrop(detailLayer);
+            if (backdrop != null) {
+                openScreenNow(s, history);
+                activeTransition =
+                        PlayerTransitionHelper.startDetailToPlayerTransition(
+                                root,
+                                null,
+                                null,
+                                backdrop,
+                                true,
+                                portal.posterBitmap,
+                                posterOriginPx,
+                                posterRadiusPx,
+                                safeInsetsPx,
+                                false,
+                                false,
+                                glassFreezeController,
+                                () -> activeTransition = null);
+                return;
+            }
+        }
+
+        final int serial = ++transitionSerial;
+        pendingPlayerTransition = true;
+        PlayerTransitionHelper.TransitionHandle handle =
+                PlayerTransitionHelper.startDetailToPlayerTransition(
+                        null,
+                        detailLayer,
+                        portal.ambientPosterView,
+                        null,
+                        false,
+                        null,
+                        posterOriginPx,
+                        posterRadiusPx,
+                        safeInsetsPx,
+                        isTvDevice(),
+                        reduced,
+                        glassFreezeController,
+                        () -> {
+                            pendingPlayerTransition = false;
+                            if (serial != transitionSerial
+                                    || isFinishing()
+                                    || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) {
+                                return;
+                            }
+                            activeTransition = null;
+                            openScreenNow(s, history);
+                        });
+        if (serial == transitionSerial && pendingPlayerTransition) {
+            activeTransition = handle;
+        }
+    }
+
+    static boolean shouldPostOnboardingContainerFocus(boolean tvMode) {
+        return !tvMode;
+    }
+
+    static final class OnboardingFinishCoordinator {
+        private final int initialScale;
+        private boolean followUpActionRequested;
+        private boolean recreateScheduled;
+        private boolean recreateExecuted;
+
+        OnboardingFinishCoordinator(int initialScale) {
+            this.initialScale = initialScale;
+        }
+
+        boolean onFinished(int currentScale, Runnable postDeferredRecreate, Runnable restoreFocus) {
+            if (currentScale != initialScale) {
+                if (!followUpActionRequested && !recreateScheduled) {
+                    recreateScheduled = true;
+                    if (postDeferredRecreate != null) {
+                        postDeferredRecreate.run();
+                    }
+                }
+                return true;
+            }
+            if (!followUpActionRequested && restoreFocus != null) {
+                restoreFocus.run();
+            }
+            return false;
+        }
+
+        boolean runDeferredRecreateIfStillNeeded(boolean activityAlive, Runnable recreateAction) {
+            if (followUpActionRequested || recreateExecuted || !activityAlive) {
+                recreateScheduled = false;
+                return false;
+            }
+            recreateScheduled = false;
+            recreateExecuted = true;
+            if (recreateAction != null) {
+                recreateAction.run();
+            }
+            return true;
+        }
+
+        boolean beginFollowUpAction(boolean activityAlive) {
+            followUpActionRequested = true;
+            recreateScheduled = false;
+            return activityAlive && !recreateExecuted;
+        }
+
+        boolean isRecreateScheduled() {
+            return recreateScheduled;
+        }
+
+        boolean isRecreateExecuted() {
+            return recreateExecuted;
+        }
+    }
+
+    void showOnboarding(boolean isReplay) {
+        if (isFinishing() || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
+        if (root == null) return;
+        if (current != null && current.player && !miniMode) return;
+        dismissOnboarding();
+        cancelActiveTransition();
+
+        final int initialScale = prefs.getInt(Prefs.UI_SCALE_PERCENT, 100);
+        final OnboardingFinishCoordinator finishCoordinator =
+                new OnboardingFinishCoordinator(initialScale);
+        boolean reduceTransparency = prefs.getBoolean(Prefs.REDUCED_TRANSPARENCY, false);
+        OnboardingScreen screen =
+                new OnboardingScreen(
+                        this,
+                        isTvDevice(),
+                        reduced,
+                        reduceTransparency,
+                        initialScale,
+                        new OnboardingScreen.Callbacks() {
+                            @Override
+                            public void onImportConfig(String initialEmptyUrl) {
+                                if (activeOnboarding != null) {
+                                    activeOnboarding.getController().complete(false);
+                                }
+                                dismissOnboarding();
+                                boolean alive =
+                                        !isFinishing()
+                                                && (Build.VERSION.SDK_INT < 17 || !isDestroyed());
+                                if (finishCoordinator.beginFollowUpAction(alive)) {
+                                    importDialog();
+                                }
+                            }
+
+                            @Override
+                            public void onOpenSync() {
+                                if (activeOnboarding != null) {
+                                    activeOnboarding.getController().complete(false);
+                                }
+                                dismissOnboarding();
+                                boolean alive =
+                                        !isFinishing()
+                                                && (Build.VERSION.SDK_INT < 17 || !isDestroyed());
+                                if (finishCoordinator.beginFollowUpAction(alive) && !privateMode) {
+                                    CloudSyncDialog.show(
+                                            MainActivity.this, MainActivity.this::refresh);
+                                }
+                            }
+
+                            @Override
+                            public void onPersonalizationChanged(
+                                    boolean reduceMotion,
+                                    boolean nextReduceTransparency,
+                                    int uiScalePercent) {
+                                prefs.edit()
+                                        .putBoolean(Prefs.REDUCED, reduceMotion)
+                                        .putBoolean(
+                                                Prefs.REDUCED_TRANSPARENCY, nextReduceTransparency)
+                                        .putInt(Prefs.UI_SCALE_PERCENT, uiScalePercent)
+                                        .apply();
+                                reduced = reduceMotion;
+                                if (onboardingAurora != null) {
+                                    onboardingAurora.setReducedMotion(reduceMotion);
+                                }
+                                if (root != null) {
+                                    com.pilipala.glass.GlassworkSurface.invalidateBackdrop(root);
+                                }
+                            }
+
+                            @Override
+                            public void onFinished(boolean skipped) {
+                                dismissOnboarding();
+                                int nextScale = prefs.getInt(Prefs.UI_SCALE_PERCENT, 100);
+                                finishCoordinator.onFinished(
+                                        nextScale,
+                                        () ->
+                                                ui.post(
+                                                        () -> {
+                                                            boolean alive =
+                                                                    !isFinishing()
+                                                                            && (Build.VERSION
+                                                                                                    .SDK_INT
+                                                                                            < 17
+                                                                                    || !isDestroyed());
+                                                            finishCoordinator
+                                                                    .runDeferredRecreateIfStillNeeded(
+                                                                            alive,
+                                                                            MainActivity.this
+                                                                                    ::recreate);
+                                                        }),
+                                        () -> {
+                                            if (current != null) {
+                                                restore(current);
+                                            }
+                                        });
+                            }
+                        });
+        screen.setTag("onboarding-screen");
+        if (isTvDevice()) {
+            screen.setDescendantFocusability(ViewGroup.FOCUS_AFTER_DESCENDANTS);
+        } else {
+            AuroraSurfaceView aurora = new AuroraSurfaceView(this);
+            aurora.setReducedMotion(reduced);
+            onboardingAurora = aurora;
+            screen.setBackgroundLayer(aurora);
+        }
+
+        savedOnboardingFocusability.clear();
+        savedOnboardingViewFocusable.clear();
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View child = root.getChildAt(i);
+            if (child instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) child;
+                savedOnboardingFocusability.put(vg, vg.getDescendantFocusability());
+                vg.setDescendantFocusability(ViewGroup.FOCUS_BLOCK_DESCENDANTS);
+            } else if (child.isFocusable()) {
+                savedOnboardingViewFocusable.put(child, Boolean.TRUE);
+                child.setFocusable(false);
+            }
+        }
+        activeOnboarding = screen;
+        root.addView(screen, new FrameLayout.LayoutParams(-1, -1));
+        if (shouldPostOnboardingContainerFocus(isTvDevice())) {
+            screen.post(screen::requestFocus);
+        }
+    }
+
+    void dismissOnboarding() {
+        OnboardingScreen screen = activeOnboarding;
+        activeOnboarding = null;
+        if (onboardingAurora != null) {
+            onboardingAurora.setActive(false);
+            onboardingAurora = null;
+        }
+        if (screen != null && screen.getParent() instanceof ViewGroup) {
+            ((ViewGroup) screen.getParent()).removeView(screen);
+        }
+        for (Map.Entry<ViewGroup, Integer> entry : savedOnboardingFocusability.entrySet()) {
+            entry.getKey().setDescendantFocusability(entry.getValue());
+        }
+        savedOnboardingFocusability.clear();
+        for (Map.Entry<View, Boolean> entry : savedOnboardingViewFocusable.entrySet()) {
+            entry.getKey().setFocusable(entry.getValue());
+        }
+        savedOnboardingViewFocusable.clear();
     }
 
     void capture() {
@@ -1157,6 +1831,9 @@ public final class MainActivity extends Activity {
                     if (scroll != null) scroll.scrollTo(0, s.scroll);
                     if (!isTvDevice()) return;
                     View target = s.focus == null ? null : root.findViewWithTag(s.focus);
+                    if (target != null
+                            && (!target.isShown() || !target.isFocusable() || !target.isEnabled()))
+                        target = null;
                     if (target != null) {
                         target.requestFocus();
                         autoFocus = target;
@@ -1164,9 +1841,13 @@ public final class MainActivity extends Activity {
                         View first = root.findViewWithTag("primary");
                         if (first == null) first = root.findViewWithTag("detail-play");
                         if (first == null && s.home) {
-                            first = root.findViewWithTag("home-tab:0");
+                            first = s.retainedHome == null ? null : s.retainedHome.topTarget();
+                            if (first == null) first = root.findViewWithTag("home-tab:0");
                             if (first == null) first = root.findViewWithTag("source-switcher");
                         }
+                        if (first != null
+                                && (!first.isShown() || !first.isFocusable() || !first.isEnabled()))
+                            first = null;
                         if (first == null) first = root.findViewWithTag("nav-home");
                         if (first == null) {
                             ArrayList<View> available = new ArrayList<>();
@@ -1194,6 +1875,19 @@ public final class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        if (activeOnboarding != null) {
+            activeOnboarding.handleBackPressed();
+            return;
+        }
+        if (pendingPlayerTransition) {
+            cancelActiveTransition();
+            return;
+        }
+        cancelActiveTransition();
+        if (markerHost != null) {
+            markerHost.cancel();
+            return;
+        }
         if (current != null && current.player && !miniMode && playerLocked) {
             PlaybackController.revealLockedHint(this);
             return;
@@ -1445,6 +2139,55 @@ public final class MainActivity extends Activity {
         SourceController.learnTitles(this, videos);
     }
 
+    void initializePhonetic() {
+        final boolean publicSpace = !privateMode;
+        final SharedPreferences target = prefs;
+        worker.execute(
+                () -> {
+                    try {
+                        PhoneticSearchIndex dictionary;
+                        synchronized (MainActivity.class) {
+                            if (sharedPhoneticDictionary == null)
+                                sharedPhoneticDictionary =
+                                        new PhoneticSearchIndex(
+                                                getAssets().open("search/pinyin-characters.tsv"),
+                                                getAssets().open("search/pinyin-phrases.dict.yaml"),
+                                                getAssets().open("search/title-phrases.txt"));
+                            dictionary = sharedPhoneticDictionary;
+                        }
+                        final PhoneticSearchIndex index = dictionary.newSession(publicSpace);
+                        // Old cache/history stay byte-for-byte intact. They have no learning
+                        // provenance,
+                        // so rebuild suggestions from newly observed public titles instead of
+                        // importing.
+                        if (publicSpace)
+                            try {
+                                org.json.JSONArray saved =
+                                        new org.json.JSONArray(
+                                                target.getString(
+                                                        Prefs.PHONETIC_PUBLIC_TITLES_V2, "[]"));
+                                for (int i = 0; i < saved.length(); i++)
+                                    index.learn(saved.optString(i));
+                            } catch (Exception ignored) {
+                            }
+                        ui.post(
+                                () -> {
+                                    try {
+                                        if (!isDestroyed()
+                                                && !isFinishing()
+                                                && !switchingPrivacy
+                                                && publicSpace == !privateMode
+                                                && prefs == target) phonetic = index;
+                                    } finally {
+                                        phoneticReady.countDown();
+                                    }
+                                });
+                    } catch (Exception ignored) {
+                        phoneticReady.countDown();
+                    }
+                });
+    }
+
     void sourceAction(Cms.Site site, String action) {
         SourceController.sourceAction(this, site, action);
     }
@@ -1581,6 +2324,9 @@ public final class MainActivity extends Activity {
             return;
         }
         DetailScreen.show(this, s, listing, ready);
+        if (root != null) {
+            activeTransition = PlayerTransitionHelper.animateTvPageFade(root, true, reduced, null);
+        }
     }
 
     void renderEpisodes(
@@ -1703,6 +2449,11 @@ public final class MainActivity extends Activity {
 
     void crossSearch(String keyword) {
         openSearch(keyword);
+    }
+
+    void minePage() {
+        if (isTvDevice()) new TvV17MineScreen(this).show();
+        else new FavoritesScreen(this).show();
     }
 
     void stopMagnet() {
@@ -1889,11 +2640,15 @@ public final class MainActivity extends Activity {
 
     void jumpHomeTop() {
         if (current == null || !current.home || scroll == null) return;
-        View target = root.findViewWithTag("home-history:0");
+        View target = current.retainedHome == null ? null : current.retainedHome.topTarget();
+        if (target == null) target = root.findViewWithTag("home-history:0");
         if (target == null) target = root.findViewWithTag("home-tab:0");
         if (target == null) target = root.findViewWithTag("source-switcher");
         if (target == null) target = root.findViewWithTag("primary");
-        if (target != null) target.requestFocus();
+        if (target != null && target.isShown() && target.isFocusable() && target.isEnabled()) {
+            target.requestFocus();
+            current.focus = String.valueOf(target.getTag());
+        }
         current.scroll = 0;
         smoothHomeScroll(0);
     }
@@ -1915,6 +2670,9 @@ public final class MainActivity extends Activity {
             }
             return true;
         }
+        if (activeOnboarding != null) {
+            return super.dispatchKeyEvent(event);
+        }
         if (current != null && current.player && !miniMode && playerLocked) {
             if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
                 PlaybackController.revealLockedHint(this);
@@ -1922,7 +2680,9 @@ public final class MainActivity extends Activity {
             return true;
         }
 
-        if (shortcutScreen != current) {
+        if (markerHost != null && markerHost.key(event)) return true;
+
+        if (!isTvDevice() && shortcutScreen != current) {
             homeKeys.reset();
             shortcutScreen = current;
         }
@@ -1933,7 +2693,8 @@ public final class MainActivity extends Activity {
                 if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) chooseSources();
                 return true;
             }
-            if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            // TV directional taps always follow focus; the legacy non-TV shortcut is unchanged.
+            if (!isTvDevice() && event.getAction() == KeyEvent.ACTION_DOWN) {
                 if (key == KeyEvent.KEYCODE_DPAD_UP) {
                     if (homeKeys.up(event.getEventTime(), event.getRepeatCount())) {
                         jumpHomeTop();
@@ -1955,6 +2716,7 @@ public final class MainActivity extends Activity {
     public void onWindowFocusChanged(boolean focus) {
         super.onWindowFocusChanged(focus);
         if (!focus) {
+            if (markerHost != null) markerHost.abort();
             finishSeek(false);
             PluginDialogStyler.watch(this);
         }
@@ -2006,12 +2768,15 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onPause() {
+        cancelActiveTransition();
+        if (markerHost != null) markerHost.abort();
         savePlaybackHistory(true);
         super.onPause();
     }
 
     @Override
     protected void onStop() {
+        cancelActiveTransition();
         PrivacySpace.cancelPrompt(this);
         finishSeek(false);
         if (playbackLoading != null) {
@@ -2056,12 +2821,16 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         CloudSyncDialog.cancel(this);
+        if (isTvDevice() && privateMode && !switchingPrivacy) VideoMarkerRepository.clearPrivate();
         if (privateMode && isFinishing() && !switchingPrivacy) {
             MobileShell.clearSearchSession();
             VideoSkipStore.clearPrivateRecords();
+            VideoMarkerRepository.clearPrivate();
             PrivacySpace.active = false;
         }
         if (activeActivity == this) activeActivity = null;
+        cancelActiveTransition();
+        dismissOnboarding();
         clearPlaybackLoading();
         if (phoneConfig != null) phoneConfig.close();
         stopCastService();

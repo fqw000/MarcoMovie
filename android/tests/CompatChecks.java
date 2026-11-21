@@ -80,7 +80,7 @@ public final class CompatChecks {
         HomeKeyTracker shortcuts = new HomeKeyTracker();
         check(
                 !shortcuts.up(100, 0) && !shortcuts.up(300, 0) && shortcuts.up(500, 0),
-                "three discrete up taps trigger home shortcut");
+                "legacy non-TV three discrete up taps trigger home shortcut");
         check(!shortcuts.up(600, 1) && !shortcuts.up(700, 2), "held Up does not count as taps");
         shortcuts.reset();
         check(
@@ -568,10 +568,17 @@ public final class CompatChecks {
 
                 Path deps = root.resolve("tools/java-dependencies");
                 Path jsonJar = root.resolve("android/tests/lib/json-20240303.jar");
+                String envAndroidJar = System.getenv("MARCOMOVIE_ANDROID_JAR");
+                Path androidJar =
+                        (envAndroidJar != null
+                                        && !envAndroidJar.trim().isEmpty()
+                                        && Files.isRegularFile(Paths.get(envAndroidJar)))
+                                ? Paths.get(envAndroidJar)
+                                : root.resolve("tools/android-35/android.jar");
                 List<Path> cpEntries =
                         Arrays.asList(
                                 jsonJar,
-                                root.resolve("tools/android-35/android.jar"),
+                                androidJar,
                                 deps.resolve("okhttp-3.14.9.jar"),
                                 deps.resolve("okio-1.17.2.jar"),
                                 deps.resolve("gson-2.10.1.jar"),
@@ -611,6 +618,7 @@ public final class CompatChecks {
                                 pkg.resolve("TvLayoutPolicy.java").toString(),
                                 pkg.resolve("Prefs.java").toString(),
                                 pkg.resolve("AppLog.java").toString(),
+                                pkg.resolve("LiveQualityPolicy.java").toString(),
                                 pkg.resolve("LiveCatalog.java").toString(),
                                 pkg.resolve("VideoFilters.java").toString(),
                                 pkg.resolve("SourceEngine.java").toString(),

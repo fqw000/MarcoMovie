@@ -5,15 +5,28 @@ import java.util.*;
 /** Stable catalogue order for cross-group channel stepping and numeric tuning. */
 final class LiveSession {
     final LiveCatalog.Source source;
+    final LiveCatalog.Catalog catalog;
     final List<LiveCatalog.Channel> channels = new ArrayList<>();
+    volatile LiveEpgService.Guide epgGuide;
     int index = -1;
     String digits = "";
 
     LiveSession(LiveCatalog.Source selected, LiveCatalog.Catalog catalog) {
         source = selected;
+        this.catalog = catalog;
         for (LiveCatalog.Group group : catalog.groups)
             for (LiveCatalog.Channel channel : group.channels)
                 if (!channel.streams.isEmpty()) channels.add(channel);
+    }
+
+    static LiveSession forChannel(
+            LiveCatalog.Source source, LiveCatalog.Catalog catalog, LiveCatalog.Channel channel) {
+        if (source == null || catalog == null || channel == null)
+            throw new IllegalArgumentException("直播目录已失效");
+        LiveSession session = new LiveSession(source, catalog);
+        session.index = session.channels.indexOf(channel);
+        if (session.index < 0) throw new IllegalArgumentException("频道不在当前直播目录中");
+        return session;
     }
 
     int step(int direction) {

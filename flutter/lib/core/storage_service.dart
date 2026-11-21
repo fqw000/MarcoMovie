@@ -15,7 +15,9 @@ import 'csp_bridge.dart';
 import 'models.dart';
 import 'quark_account.dart';
 import 'netdisk_session.dart';
+import 'ohos_runtime.dart';
 import 'secure_credential_store.dart';
+import 'spider_plugin_registry.dart';
 import 'storage_file_store.dart';
 
 export 'storage_file_store.dart';
@@ -85,9 +87,22 @@ class StorageService {
   static const String keySyncLastStatus = 'sync_last_status';
   static const String keyVideoSkipRecords = 'video_skip_records';
   static const String keyPlayerAlwaysShowClock = 'player_always_show_clock';
+<<<<<<< HEAD
   static const String keyAdFilterEnabled = 'ad_filter_enabled';
   static const String keyAdFilterRulesJson = 'ad_filter_rules_json';
   static const String keyUseBuiltinRules = 'use_builtin_rules';
+=======
+  static const String keyTvUiMode = 'tv_ui_mode';
+  static const String keyTvAmbientTheme = 'tv_ambient_theme';
+  static const String keyTvAmbientIntensity = 'tv_ambient_intensity';
+  static const String keyTvAmbientPosterSync = 'tv_ambient_poster_sync';
+  static const String keyHomeSnapshots = 'site_home_snapshots_v1';
+  static const String keySpiderAdapterPacks = 'spider_adapter_packs_v1';
+  static const String keySpiderGatewayEnabled = 'spider_gateway_enabled';
+  static const String keySpiderGatewayUrl = 'spider_gateway_url';
+  static const String keySpiderGatewayDeviceName = 'spider_gateway_device_name';
+  static const String keySpiderGatewayToken = 'spider_gateway_token';
+>>>>>>> upstream/main
   static const int maxVideoSkipRecords = 500;
   static const String _subscriptionsFileName = 'subscriptions.json';
   static const String _watchHistoryFileName = 'watch_history.json';
@@ -461,6 +476,7 @@ class StorageService {
     await _cleanupLeftoverTempFiles();
     await _migrateCredentialsIfNeeded();
     await _migrateFromPrefsIfNeeded();
+    _hydrateSpiderExtensions();
     getSubscriptions();
   }
 
@@ -499,6 +515,7 @@ class StorageService {
       keyUcCookie,
       keyBaiduCookie,
       keyAliToken,
+      keySpiderGatewayToken,
     ]) {
       if (_prefs.containsKey(key)) {
         final plain = _prefs.getString(key) ?? '';
@@ -599,6 +616,13 @@ class StorageService {
         return _resolveFallbackDataDir(prefs);
       }
       return Directory('${Directory.systemTemp.path}/marco_movie_data');
+    }
+    if (OhosRuntime.isOhos &&
+        OhosRuntime.filesDir != null &&
+        OhosRuntime.filesDir!.isNotEmpty) {
+      final dir = Directory('${OhosRuntime.filesDir}/data');
+      _cachedProductionDataDir = dir;
+      return dir;
     }
     try {
       final support = await getApplicationSupportDirectory();
@@ -702,6 +726,12 @@ class StorageService {
       _prefs.getString(keyDefaultAspectMode) ?? 'contain';
   String get playerKernel =>
       _prefs.getString(keyPlayerKernel) ?? 'exo';
+  String get tvUiMode => _prefs.getString(keyTvUiMode) ?? 'auto';
+  String get tvAmbientTheme => _prefs.getString(keyTvAmbientTheme) ?? 'aurora';
+  String get tvAmbientIntensity =>
+      _prefs.getString(keyTvAmbientIntensity) ?? 'standard';
+  bool get tvAmbientPosterSync =>
+      _prefs.getBool(keyTvAmbientPosterSync) ?? true;
   String get quarkCookie =>
       _credentialCache[keyQuarkCookie] ?? _prefs.getString(keyQuarkCookie) ?? '';
   String get ucCookie =>
@@ -1315,6 +1345,9 @@ class StorageService {
     await _prefs.setString(keyOrigin, public.isEmpty ? '' : public.first.url);
     await _prefs.setString(keyDepots, '[]');
     await _prefs.setString(keyActiveDepotName, public.isEmpty ? '' : public.first.activeDepotName);
+    for (final old in removed) {
+      await clearCachedSiteHomes(subscriptionId: old.id);
+    }
     _invalidateConfigCache();
     final config = loadSavedConfig();
     final availPublic = config?.publicAvailableSites ?? const <CmsSite>[];
@@ -1674,6 +1707,15 @@ class StorageService {
     final hidden = {...?_prefs.getStringList(_removedSites), siteIdentity};
     await _prefs.setStringList(_removedSites, hidden.toList());
   });
+
+  Future<void> hideSites(Iterable<String> siteIdentities) =>
+      _editSubscriptions(() async {
+        final additions = siteIdentities.where((id) => id.isNotEmpty).toList();
+        if (additions.isEmpty) return;
+        _invalidateConfigCache();
+        final hidden = {...?_prefs.getStringList(_removedSites), ...additions};
+        await _prefs.setStringList(_removedSites, hidden.toList());
+      });
 
   Future<void> removeSite(String siteIdentity) => hideSite(siteIdentity);
 
@@ -2213,6 +2255,37 @@ class StorageService {
   Future<void> setPlayerKernel(String kernel) async {
     await _prefs.setString(keyPlayerKernel, kernel.trim());
   }
+  Future<void> setTvUiMode(String mode) async {
+    final normalized = switch (mode.trim().toLowerCase()) {
+      'tv' => 'tv',
+      'standard' => 'standard',
+      _ => 'auto',
+    };
+    await _prefs.setString(keyTvUiMode, normalized);
+    OhosRuntime.uiModeRevision.value++;
+  }
+
+  Future<void> setTvAmbientTheme(String themeId) async {
+    const allowed = {'aurora', 'twilight', 'ocean', 'amber', 'nebula', 'frost'};
+    final normalized = themeId.trim().toLowerCase();
+    await _prefs.setString(
+      keyTvAmbientTheme,
+      allowed.contains(normalized) ? normalized : 'aurora',
+    );
+  }
+
+  Future<void> setTvAmbientIntensity(String intensity) async {
+    final normalized = switch (intensity.trim().toLowerCase()) {
+      'soft' => 'soft',
+      'vivid' => 'vivid',
+      _ => 'standard',
+    };
+    await _prefs.setString(keyTvAmbientIntensity, normalized);
+  }
+
+  Future<void> setTvAmbientPosterSync(bool enabled) async {
+    await _prefs.setBool(keyTvAmbientPosterSync, enabled);
+  }
   /// Selects the recommended line index from [lines] based on [preferredQuality]
   /// and the user's configured Netdisk drive order.
   int pickRecommendedLineIndex(List<CmsLine> lines) {
@@ -2742,9 +2815,179 @@ class StorageService {
     if (list.length > 16) list.removeRange(16, list.length);
     await _prefs.setString(storageKey, jsonEncode(list));
   }
+  Future<void> removeSearchKeyword(
+    String keyword, {
+    bool forPrivate = false,
+  }) async {
+    final trimmed = keyword.trim();
+    if (trimmed.isEmpty) return;
+    final storageKey = forPrivate ? keyPrivateSearchHistory : keySearchHistory;
+    final list = getSearchHistory(forPrivate: forPrivate)
+        .where((k) => k != trimmed)
+        .toList();
+    await _prefs.setString(storageKey, jsonEncode(list));
+  }
   Future<void> clearSearchHistory({bool forPrivate = false}) async {
     final storageKey = forPrivate ? keyPrivateSearchHistory : keySearchHistory;
     await _prefs.setString(storageKey, '[]');
+    if (!forPrivate) {
+      await clearCachedSiteHomes();
+    }
+  }
+
+  static String _siteHomeSnapshotKey(CmsSite site) =>
+      '${site.subscriptionId}::${site.key}::${site.api}::${site.ext.hashCode}';
+
+  ({List<CmsCategory> categories, CmsListing listing})? getCachedSiteHome(
+    CmsSite site,
+  ) {
+    if (site.isEffectivelyPrivate) return null;
+    final raw = _prefs.getString(keyHomeSnapshots);
+    if (raw == null || raw.isEmpty) return null;
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return null;
+      final entry = decoded[_siteHomeSnapshotKey(site)];
+      if (entry is! Map) return null;
+      final savedAt = (entry['ts'] as num?)?.toInt() ?? 0;
+      // Expire snapshots older than 7 days so dead sites do not linger forever.
+      if (savedAt > 0 &&
+          DateTime.now().millisecondsSinceEpoch - savedAt >
+              7 * 24 * 3600 * 1000) {
+        return null;
+      }
+      final cats = <CmsCategory>[
+        for (final c in (entry['categories'] as List? ?? const []))
+          if (c is Map &&
+              (c['id'] ?? '').toString().isNotEmpty &&
+              (c['name'] ?? '').toString().isNotEmpty)
+            CmsCategory(
+              id: c['id'].toString(),
+              name: c['name'].toString(),
+              parentId: (c['parentId'] ?? '').toString(),
+            ),
+      ];
+      final vids = <CmsVideo>[
+        for (final v in (entry['videos'] as List? ?? const []))
+          if (v is Map &&
+              ((v['id'] ?? '').toString().isNotEmpty ||
+                  (v['title'] ?? '').toString().isNotEmpty))
+            CmsVideo(
+              id: (v['id'] ?? '').toString(),
+              title: (v['title'] ?? '').toString(),
+              poster: (v['poster'] ?? '').toString(),
+              remarks: (v['remarks'] ?? '').toString(),
+              year: (v['year'] ?? '').toString(),
+              area: (v['area'] ?? '').toString(),
+              actor: (v['actor'] ?? '').toString(),
+              description: (v['description'] ?? '').toString(),
+              tag: (v['tag'] ?? '').toString(),
+              doubanScore: (v['doubanScore'] as num?)?.toDouble(),
+              rtScore: (v['rtScore'] as num?)?.toInt(),
+            ),
+      ];
+      if (vids.isEmpty) return null;
+      return (
+        categories: cats,
+        listing: CmsListing(
+          page: 1,
+          pageCount: ((entry['pageCount'] as num?)?.toInt() ?? 1).clamp(
+            1,
+            9999,
+          ),
+          videos: vids,
+          sourceFiltered: entry['sourceFiltered'] == true,
+        ),
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveCachedSiteHome(
+    CmsSite site,
+    List<CmsCategory> categories,
+    CmsListing listing,
+  ) async {
+    if (site.isEffectivelyPrivate || listing.videos.isEmpty) return;
+    try {
+      final existing = <String, dynamic>{};
+      final raw = _prefs.getString(keyHomeSnapshots);
+      if (raw != null && raw.isNotEmpty) {
+        final parsed = jsonDecode(raw);
+        if (parsed is Map) {
+          for (final e in parsed.entries) {
+            if (e.value is Map) existing[e.key.toString()] = e.value;
+          }
+        }
+      }
+      final key = _siteHomeSnapshotKey(site);
+      existing.remove(key);
+      existing[key] = <String, dynamic>{
+        'subId': site.subscriptionId,
+        'ts': DateTime.now().millisecondsSinceEpoch,
+        'pageCount': listing.pageCount,
+        'sourceFiltered': listing.sourceFiltered,
+        'categories': [
+          for (final c in categories.take(40))
+            {
+              'id': c.id,
+              'name': c.name,
+              if (c.parentId.isNotEmpty) 'parentId': c.parentId,
+            },
+        ],
+        'videos': [
+          for (final v in listing.videos.take(36))
+            {
+              'id': v.id,
+              'title': v.title,
+              if (v.poster.isNotEmpty) 'poster': v.poster,
+              if (v.remarks.isNotEmpty) 'remarks': v.remarks,
+              if (v.year.isNotEmpty) 'year': v.year,
+              if (v.area.isNotEmpty) 'area': v.area,
+              if (v.tag.isNotEmpty) 'tag': v.tag,
+              if (v.doubanScore != null) 'doubanScore': v.doubanScore,
+              if (v.rtScore != null) 'rtScore': v.rtScore,
+            },
+        ],
+      };
+      while (existing.length > 8) {
+        existing.remove(existing.keys.first);
+      }
+      await _prefs.setString(keyHomeSnapshots, jsonEncode(existing));
+    } catch (_) {}
+  }
+
+  Future<void> clearCachedSiteHomes({String? subscriptionId}) async {
+    if (subscriptionId == null) {
+      await _prefs.remove(keyHomeSnapshots);
+      return;
+    }
+    final raw = _prefs.getString(keyHomeSnapshots);
+    if (raw == null || raw.isEmpty) return;
+    try {
+      final parsed = jsonDecode(raw);
+      if (parsed is! Map) {
+        await _prefs.remove(keyHomeSnapshots);
+        return;
+      }
+      final kept = <String, dynamic>{};
+      for (final e in parsed.entries) {
+        final v = e.value;
+        final subId = v is Map ? (v['subId'] ?? '').toString() : '';
+        if (subId != subscriptionId &&
+            !e.key.toString().startsWith('$subscriptionId::')) {
+          kept[e.key.toString()] = v;
+        }
+      }
+      if (kept.isEmpty) {
+        await _prefs.remove(keyHomeSnapshots);
+      } else {
+        await _prefs.setString(keyHomeSnapshots, jsonEncode(kept));
+      }
+    } catch (_) {
+      await _prefs.remove(keyHomeSnapshots);
+    }
   }
   /// Exports a backup JSON string compatible with both Android (`MarcoMovie-1`) and Flutter.
   String publicSupportedKey() {
@@ -4595,5 +4838,103 @@ class StorageService {
       _syncInFlight = false;
       if (ownsClient) httpClient.close();
     }
+  }
+
+  // ==================== Cross-Platform Spider Adapter Packs & BYO Gateway ====================
+
+  List<SpiderAdapterPack> get spiderAdapterPacks {
+    final raw = _prefs.getString(keySpiderAdapterPacks);
+    if (raw == null || raw.trim().isEmpty) return const <SpiderAdapterPack>[];
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! List) return const <SpiderAdapterPack>[];
+      final out = <SpiderAdapterPack>[];
+      for (final item in decoded) {
+        if (item is Map) {
+          try {
+            out.add(SpiderAdapterPack.fromJson(Map<String, dynamic>.from(item)));
+          } catch (_) {}
+        }
+      }
+      return out;
+    } catch (_) {
+      return const <SpiderAdapterPack>[];
+    }
+  }
+
+  SpiderGatewayConfig get spiderGatewayConfig {
+    return SpiderGatewayConfig(
+      enabled: _prefs.getBool(keySpiderGatewayEnabled) ?? false,
+      baseUrl: _prefs.getString(keySpiderGatewayUrl) ?? '',
+      token: _credentialCache[keySpiderGatewayToken] ?? '',
+      deviceName: _prefs.getString(keySpiderGatewayDeviceName) ?? '',
+    );
+  }
+
+  void _hydrateSpiderExtensions() {
+    SpiderPluginRegistry.instance.hydrate(
+      packs: spiderAdapterPacks,
+      gateway: spiderGatewayConfig,
+    );
+  }
+
+  Future<void> saveSpiderAdapterPacks(List<SpiderAdapterPack> packs) async {
+    final encoded = jsonEncode([for (final p in packs) p.toJson()]);
+    if (utf8.encode(encoded).length > SpiderAdapterPack.maxPackBytes * 4) {
+      throw const FormatException('已安装的插件包总大小超过 8 MB 上限');
+    }
+    await _prefs.setString(keySpiderAdapterPacks, encoded);
+    SpiderPluginRegistry.instance.setPacks(packs);
+    _invalidateConfigCache();
+  }
+
+  Future<SpiderAdapterPack> importSpiderAdapterPackJson(
+    String rawJson, {
+    String sourceUrl = '',
+  }) async {
+    final pack = SpiderAdapterPack.parseJsonString(
+      rawJson,
+      fallbackSourceUrl: sourceUrl,
+    );
+    final current = List<SpiderAdapterPack>.of(spiderAdapterPacks);
+    final existingIdx = current.indexWhere((p) => p.id == pack.id);
+    if (existingIdx >= 0) {
+      current[existingIdx] = pack;
+    } else {
+      current.insert(0, pack);
+    }
+    await saveSpiderAdapterPacks(current);
+    return pack;
+  }
+
+  Future<void> setSpiderAdapterPackEnabled(String packId, bool enabled) async {
+    final current = spiderAdapterPacks
+        .map((p) => p.id == packId ? p.copyWith(enabled: enabled) : p)
+        .toList();
+    await saveSpiderAdapterPacks(current);
+  }
+
+  Future<void> removeSpiderAdapterPack(String packId) async {
+    final current = spiderAdapterPacks.where((p) => p.id != packId).toList();
+    await saveSpiderAdapterPacks(current);
+  }
+
+  Future<void> saveSpiderGatewayConfig(SpiderGatewayConfig config) async {
+    final normalized = SpiderGatewayConfig.normalizeBaseUrl(config.baseUrl);
+    if (config.enabled && normalized.isEmpty) {
+      throw const FormatException('请先填写有效的网关地址（如 http://127.0.0.1:9981 或 https://gateway.example）');
+    }
+    final clean = SpiderGatewayConfig(
+      enabled: config.enabled && normalized.isNotEmpty,
+      baseUrl: normalized,
+      token: config.token.trim(),
+      deviceName: config.deviceName.trim(),
+    );
+    await _prefs.setBool(keySpiderGatewayEnabled, clean.enabled);
+    await _prefs.setString(keySpiderGatewayUrl, clean.baseUrl);
+    await _prefs.setString(keySpiderGatewayDeviceName, clean.deviceName);
+    await _writeSecret(keySpiderGatewayToken, clean.token);
+    SpiderPluginRegistry.instance.setGatewayConfig(clean);
+    _invalidateConfigCache();
   }
 }

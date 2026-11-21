@@ -1,20 +1,27 @@
 import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui';
+import 'dart:ui' show ImageFilter;
+import 'dart:ui' as ui show FragmentProgram, Image;
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter/material.dart';
 import '../core/cms_client.dart';
 import '../core/cms_parser.dart';
 import '../core/csp_bridge.dart';
 import '../core/download_service.dart';
+import '../core/media_badges.dart';
 import '../core/models.dart';
+import '../core/ohos_runtime.dart';
 import '../core/storage_service.dart';
 import '../core/web_media_resolver.dart';
 import '../core/wogg_source.dart';
 import 'apple_theme.dart';
 import 'desktop_horizontal_scroller.dart';
+import 'ios_liquid_glass.dart';
+import 'media_badge.dart';
+import 'motion/player_enter_transition.dart';
 import 'netdisk_sheet.dart';
 import 'player_screen.dart';
 import 'poster_image.dart';
@@ -35,12 +42,31 @@ class DetailScreen extends StatefulWidget {
   final CmsVideo initialVideo;
   final CmsClient client;
   final StorageService storage;
+  @visibleForTesting
+  final Widget Function(
+    BuildContext context,
+    CmsSite site,
+    CmsVideo video,
+    int lineIndex,
+    int episodeIndex,
+    int resumeMs,
+  )? debugPlayerBuilder;
+  @visibleForTesting
+  final BackdropImageCapturer? debugTransitionCapturer;
+  @visibleForTesting
+  final ui.FragmentProgram? debugTransitionShaderProgram;
+  @visibleForTesting
+  final ValueChanged<PlayerTransitionMode>? debugOnTransitionModeResolved;
   const DetailScreen({
     super.key,
     required this.site,
     required this.initialVideo,
     required this.client,
     required this.storage,
+    this.debugPlayerBuilder,
+    this.debugTransitionCapturer,
+    this.debugTransitionShaderProgram,
+    this.debugOnTransitionModeResolved,
   });
 
   static List<CmsSite> selectRelatedSeasonSiblings(
@@ -148,6 +174,10 @@ class _DetailScreenState extends State<DetailScreen> {
   Completer<void>? _detailAbort;
   Completer<void>? _seasonAbort;
   int _detailEpoch = 0;
+  final GlobalKey _transitionBackdropKey = GlobalKey();
+  final GlobalKey _transitionPosterKey = GlobalKey();
+  Uint8List? _loadedPosterBytes;
+  String _loadedPosterIdentity = '';
 
   static bool _canShowInitialLinesImmediately(CmsSite site, CmsVideo video) {
     if (!video.lines.any((l) => l.episodes.isNotEmpty)) return false;
@@ -200,6 +230,14 @@ class _DetailScreenState extends State<DetailScreen> {
       ),
     ];
     _descending = widget.storage.episodesDescending;
+    if (!OhosRuntime.isOhos) {
+      unawaited(MediaBadges.ensureInitialized().then((_) {
+        if (mounted) setState(() {});
+      }));
+      if (!isWindowsDesktopUi) {
+        unawaited(PlayerEnterTransition.prewarmShader());
+      }
+    }
     _isFavorite = widget.storage.isFavorite(
       _activeSite.key,
       _video.id,
@@ -215,6 +253,8 @@ class _DetailScreenState extends State<DetailScreen> {
       preferHd: true,
     );
     if (immediateBytes != null) {
+      _loadedPosterBytes = immediateBytes;
+      _loadedPosterIdentity = _currentPosterIdentity;
       _posterAmbientColor = PosterLoader.peekAmbientColor(immediateBytes);
       if (_posterAmbientColor == null) {
         unawaited(_updateAmbientFromBytes(immediateBytes));
@@ -229,6 +269,38 @@ class _DetailScreenState extends State<DetailScreen> {
 
   String get _publicLookupTitle =>
       _activeSite.isEffectivelyPrivate ? '' : _video.title;
+
+  String get _currentPosterIdentity =>
+      '${_activeSite.key}|${_video.id}|${_video.poster}|$_publicLookupTitle|${_video.year}';
+
+  void _onPosterCardBytesLoaded(Uint8List bytes) {
+    _loadedPosterBytes = bytes;
+    _loadedPosterIdentity = _currentPosterIdentity;
+    unawaited(_updateAmbientFromBytes(bytes));
+  }
+
+  Future<ui.Image?> _obtainTransitionPosterImage() async {
+    if (OhosRuntime.isOhos || isWindowsDesktopUi) return null;
+    final currentId = _currentPosterIdentity;
+    final bytes = (_loadedPosterIdentity == currentId
+            ? _loadedPosterBytes
+            : null) ??
+        PosterLoader.peekMemory(
+          _video.poster,
+          title: _publicLookupTitle,
+          year: _video.year,
+          preferHd: true,
+        );
+    if (bytes == null || bytes.isEmpty) {
+      return null;
+    }
+    final cloned =
+        PlayerEnterTransition.cloneRenderedImage(_transitionPosterKey);
+    if (cloned != null) {
+      return cloned;
+    }
+    return PlayerEnterTransition.decodePosterBytes(bytes);
+  }
 
   @override
   void dispose() {
@@ -679,9 +751,13 @@ class _DetailScreenState extends State<DetailScreen> {
     });
     final immediateBytes = PosterLoader.peekMemory(
       _video.poster,
-      title: _video.title,
+      title: _publicLookupTitle,
+      year: _video.year,
       preferHd: true,
     );
+    _loadedPosterBytes = immediateBytes;
+    _loadedPosterIdentity =
+        immediateBytes != null ? _currentPosterIdentity : '';
     if (immediateBytes != null) {
       final cachedColor = PosterLoader.peekAmbientColor(immediateBytes);
       if (cachedColor != null) {
@@ -918,18 +994,80 @@ class _DetailScreenState extends State<DetailScreen> {
       }
     }
     if (!mounted) return;
-    await Navigator.of(context).push(
-      buildApplePageRoute<void>(
-        builder: (_) => PlayerScreen(
-          site: targetSite,
-          video: targetVideo,
-          initialLineIndex: safeLine,
-          initialEpisodeIndex: safeEp,
-          initialPositionMs: effectiveResumeMs,
-          storage: widget.storage,
-        ),
-      ),
-    );
+    Widget buildPlayer(BuildContext routeCtx) {
+      final debugBuilder = widget.debugPlayerBuilder;
+      if (debugBuilder != null) {
+        return debugBuilder(
+          routeCtx,
+          targetSite,
+          targetVideo,
+          safeLine,
+          safeEp,
+          effectiveResumeMs,
+        );
+      }
+      return PlayerScreen(
+        site: targetSite,
+        video: targetVideo,
+        initialLineIndex: safeLine,
+        initialEpisodeIndex: safeEp,
+        initialPositionMs: effectiveResumeMs,
+        storage: widget.storage,
+      );
+    }
+
+    if (OhosRuntime.isOhos) {
+      await Navigator.of(context).push(
+        buildApplePageRoute<void>(builder: buildPlayer),
+      );
+    } else {
+      final hasWindowsAppearance =
+          isWindowsDesktopUi && WindowsAppearanceScope.maybeOf(context) != null;
+      final hasIndependentPosterCard =
+          hasWindowsAppearance || MediaQuery.sizeOf(context).width >= 720;
+      final reduceMotion = MediaQuery.disableAnimationsOf(context);
+      final activeProgram = widget.debugTransitionShaderProgram ??
+          PlayerEnterTransition.cachedProgram;
+
+      ui.Image? transitionPoster;
+      bool posterTransferred = false;
+      try {
+        if (hasIndependentPosterCard &&
+            !isWindowsDesktopUi &&
+            !reduceMotion &&
+            activeProgram != null &&
+            !PlayerEnterTransition.preferFastTransition &&
+            !PlayerEnterTransition.shaderLoadFailed) {
+          transitionPoster = await _obtainTransitionPosterImage();
+          if (!mounted) return;
+        }
+        final GlobalKey? activePosterKey =
+            hasIndependentPosterCard ? _transitionPosterKey : null;
+        final ui.Image? passedPoster =
+            activePosterKey != null ? transitionPoster : null;
+        final bool passedOwnsPoster = passedPoster != null;
+        if (passedOwnsPoster) {
+          posterTransferred = true;
+        }
+        await pushPlayerRoute<void>(
+          context: context,
+          backdropBoundaryKey: _transitionBackdropKey,
+          posterKey: activePosterKey,
+          posterRadiusLogical: isWindowsDesktopUi ? 16.0 : 18.0,
+          posterImage: passedPoster,
+          ownsPoster: passedOwnsPoster,
+          useFastWindowsMode: isWindowsDesktopUi,
+          debugCapturer: widget.debugTransitionCapturer,
+          debugShaderProgram: widget.debugTransitionShaderProgram,
+          onModeResolved: widget.debugOnTransitionModeResolved,
+          builder: buildPlayer,
+        );
+      } finally {
+        if (!posterTransferred && transitionPoster != null) {
+          transitionPoster.dispose();
+        }
+      }
+    }
     if (mounted) setState(() {});
   }
 
@@ -1223,6 +1361,15 @@ class _DetailScreenState extends State<DetailScreen> {
                 final line = _video.lines[i];
                 final selected = i == safeLineIdx;
                 final lineReason = _lineUnavailableReason(line);
+                final lineSpec = OhosRuntime.isOhos
+                    ? ''
+                    : MediaBadges.formatDotJoined(
+                        _specBadgesForLineOnly(line),
+                        maxBadges: 3,
+                      );
+                final baseSubtitle = lineReason != null
+                    ? '共 ${line.episodes.length} 集 · $lineReason'
+                    : '共 ${line.episodes.length} 集 · ${_activeSite.name}';
                 final tile = Container(
                   decoration: BoxDecoration(
                     color: selected
@@ -1236,9 +1383,9 @@ class _DetailScreenState extends State<DetailScreen> {
                         ? AppleColors.systemBlue
                         : AppleColors.groupedTertiary,
                     title: line.name,
-                    subtitle: lineReason != null
-                        ? '共 ${line.episodes.length} 集 · $lineReason'
-                        : '共 ${line.episodes.length} 集 · ${_activeSite.name}',
+                    subtitle: lineSpec.isEmpty
+                        ? baseSubtitle
+                        : '$baseSubtitle · $lineSpec',
                     trailing: _activeSite.isEffectivelyPrivate ? null : IconButton(
                       tooltip: widget.storage.preferredLineName == line.name ? '取消默认播放线路' : '设为默认播放线路',
                       icon: Icon(widget.storage.preferredLineName == line.name ? Icons.star_rounded : Icons.star_border_rounded,
@@ -1322,19 +1469,16 @@ class _DetailScreenState extends State<DetailScreen> {
           final cell = GestureDetector(
             onTap: () {
               if (unavailReason != null) {
-                showCupertinoDialog<void>(
-                  context: ctx,
-                  builder: (dCtx) => CupertinoAlertDialog(
-                    title: Text(ep.name),
-                    content: Padding(
-                      padding: const EdgeInsets.only(top: 6),
-                      child: Text(unavailReason),
-                    ),
-                    actions: [
-                      CupertinoDialogAction(
-                        isDefaultAction: true,
-                        onPressed: () => Navigator.of(dCtx).pop(),
-                        child: const Text('我知道了'),
+                unawaited(
+                  showAppleNativeAlert(
+                    ctx,
+                    title: ep.name,
+                    message: unavailReason,
+                    actions: const [
+                      AppleNativeAlertAction(
+                        id: 'ok',
+                        title: '我知道了',
+                        isDefault: true,
                       ),
                     ],
                   ),
@@ -1575,15 +1719,21 @@ class _DetailScreenState extends State<DetailScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final Widget screen;
     if (isWindowsDesktopUi && WindowsAppearanceScope.maybeOf(context) != null) {
-      return _buildWindowsDetail(context);
+      screen = _buildWindowsDetail(context);
+    } else {
+      final width = MediaQuery.sizeOf(context).width;
+      final wideLayout = width >= 720;
+      screen = wideLayout
+          ? _buildWideDesktopScreen(context)
+          : _buildPortraitImmersiveScreen(context);
     }
-    final width = MediaQuery.sizeOf(context).width;
-    final wideLayout = width >= 720;
-    if (!wideLayout) {
-      return _buildPortraitImmersiveScreen(context);
-    }
-    return _buildWideDesktopScreen(context);
+    if (OhosRuntime.isOhos) return screen;
+    return RepaintBoundary(
+      key: _transitionBackdropKey,
+      child: screen,
+    );
   }
 
   /// Portrait immersive layout:
@@ -2018,8 +2168,10 @@ class _DetailScreenState extends State<DetailScreen> {
   Widget _buildFloatingGlassCircleButton({
     required IconData icon,
     required VoidCallback onTap,
+    String symbol = 'chevron.backward',
+    String accessibilityLabel = '返回',
   }) {
-    return GestureDetector(
+    final fallback = GestureDetector(
       onTap: onTap,
       child: LiquidGlass(
         width: 40,
@@ -2036,6 +2188,16 @@ class _DetailScreenState extends State<DetailScreen> {
         ),
       ),
     );
+    return IosNativeGlassButton(
+      style: 'circle',
+      symbol: symbol,
+      symbolSize: 17,
+      width: 40,
+      height: 40,
+      accessibilityLabel: accessibilityLabel,
+      onTap: onTap,
+      fallback: fallback,
+    );
   }
 
   /// Top-right floating Liquid Glass source selector button (`选源`):
@@ -2049,7 +2211,7 @@ class _DetailScreenState extends State<DetailScreen> {
         ? _video.lines[safeLineIdx].name
         : (_loading ? '加载片源…' : _activeSite.name);
 
-    return GestureDetector(
+    final fallback = GestureDetector(
       key: const ValueKey('source_picker_button'),
       onTap: _showSourcePickerSheet,
       child: ConstrainedBox(
@@ -2093,6 +2255,19 @@ class _DetailScreenState extends State<DetailScreen> {
         ),
       ),
     );
+
+    return IosNativeGlassButton(
+      style: 'capsule',
+      symbol: 'square.3.layers.3d',
+      trailingSymbol: 'chevron.down',
+      label: activeLineName,
+      symbolSize: 14,
+      maxWidth: 168,
+      height: 40,
+      accessibilityLabel: '切换片源 $activeLineName',
+      onTap: _showSourcePickerSheet,
+      fallback: fallback,
+    );
   }
 
   /// Top-right floating Liquid Glass capsule:
@@ -2106,7 +2281,29 @@ class _DetailScreenState extends State<DetailScreen> {
     final driveKey = currentLine != null && currentLine.episodes.isNotEmpty
         ? currentLine.episodes.first.cloudProvider
         : null;
-    return LiquidGlass(
+
+    void onOpenNetdisk() => showNetdiskAccountSheet(
+          context,
+          widget.storage,
+          initialDriveKey: driveKey ??
+              CspBridge.netdiskDriveKeyForLineName(currentLine?.name ?? ''),
+          onChanged: () {
+            if (mounted) setState(() {});
+          },
+        );
+
+    Future<void> onToggleFavorite() async {
+      final fav = await widget.storage.toggleFavorite(
+        _activeSite,
+        _video,
+      );
+      if (mounted) {
+        setState(() => _isFavorite = fav);
+        _toast(fav ? '已加入收藏片库' : '已从片库移除');
+      }
+    }
+
+    final fallback = LiquidGlass(
       height: 40,
       borderRadius: 999,
       elevated: false,
@@ -2119,15 +2316,7 @@ class _DetailScreenState extends State<DetailScreen> {
             key: const ValueKey('detail-netdisk-qr-button'),
             padding: const EdgeInsets.symmetric(horizontal: 10),
             minSize: 32,
-            onPressed: () => showNetdiskAccountSheet(
-              context,
-              widget.storage,
-              initialDriveKey: driveKey ??
-                  CspBridge.netdiskDriveKeyForLineName(currentLine?.name ?? ''),
-              onChanged: () {
-                if (mounted) setState(() {});
-              },
-            ),
+            onPressed: onOpenNetdisk,
             child: const Icon(
               CupertinoIcons.qrcode_viewfinder,
               color: AppleColors.labelPrimary,
@@ -2157,16 +2346,7 @@ class _DetailScreenState extends State<DetailScreen> {
           CupertinoButton(
             padding: const EdgeInsets.symmetric(horizontal: 10),
             minSize: 32,
-            onPressed: () async {
-              final fav = await widget.storage.toggleFavorite(
-                _activeSite,
-                _video,
-              );
-              if (mounted) {
-                setState(() => _isFavorite = fav);
-                _toast(fav ? '已加入收藏片库' : '已从片库移除');
-              }
-            },
+            onPressed: onToggleFavorite,
             child: Icon(
               _isFavorite
                   ? CupertinoIcons.heart_fill
@@ -2179,6 +2359,31 @@ class _DetailScreenState extends State<DetailScreen> {
           ),
         ],
       ),
+    );
+
+    return IosNativeGlassPill(
+      height: 40,
+      actions: [
+        IosNativeGlassPillAction(
+          symbol: 'qrcode.viewfinder',
+          color: AppleColors.labelPrimary,
+          accessibilityLabel: '网盘扫码',
+          onTap: onOpenNetdisk,
+        ),
+        IosNativeGlassPillAction(
+          symbol: 'arrow.down.to.line',
+          color: AppleColors.labelPrimary,
+          accessibilityLabel: '离线下载',
+          onTap: _showDownloadSheet,
+        ),
+        IosNativeGlassPillAction(
+          symbol: _isFavorite ? 'heart.fill' : 'heart',
+          color: _isFavorite ? AppleColors.systemRed : AppleColors.labelPrimary,
+          accessibilityLabel: _isFavorite ? '取消收藏' : '收藏',
+          onTap: () => unawaited(onToggleFavorite()),
+        ),
+      ],
+      fallback: fallback,
     );
   }
 
@@ -2267,11 +2472,47 @@ class _DetailScreenState extends State<DetailScreen> {
               ],
               const SizedBox(height: 10),
               _buildRatingsAndSiteWrap(alignment: WrapAlignment.center),
+              if (!OhosRuntime.isOhos) ...[
+                Builder(
+                  builder: (_) {
+                    final activeLine = _video.lines.isEmpty
+                        ? null
+                        : _video.lines[safeLineIdx];
+                    final specBadges = _specBadgesForHero(activeLine);
+                    if (specBadges.isEmpty) return const SizedBox.shrink();
+                    return Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: MediaBadgeRow(
+                        badges: specBadges,
+                        maxBadges: 5,
+                        alignment: WrapAlignment.center,
+                      ),
+                    );
+                  },
+                ),
+              ],
             ],
           ),
         ),
       ),
     );
+  }
+
+  List<MediaBadge> _specBadgesForLineOnly(CmsLine? line) {
+    if (OhosRuntime.isOhos || line == null) return const <MediaBadge>[];
+    final firstEp = line.episodes.isNotEmpty ? line.episodes.first : null;
+    return MediaBadges.extractBadgesFromSources(<String?>[
+      line.name,
+      firstEp?.name,
+      firstEp?.url,
+    ]);
+  }
+
+  List<MediaBadge> _specBadgesForHero(CmsLine? line) {
+    if (OhosRuntime.isOhos) return const <MediaBadge>[];
+    final lineBadges = _specBadgesForLineOnly(line);
+    if (lineBadges.isNotEmpty) return lineBadges;
+    return MediaBadges.extractBadges(_video.remarks);
   }
 
   double? _effectiveDoubanScore() {
@@ -3516,6 +3757,7 @@ class _DetailScreenState extends State<DetailScreen> {
         ],
       ),
       child: ClipRRect(
+        key: _transitionPosterKey,
         borderRadius: BorderRadius.circular(18),
         child: AspectRatio(
           aspectRatio: 2 / 3,
@@ -3527,7 +3769,7 @@ class _DetailScreenState extends State<DetailScreen> {
                 title: _publicLookupTitle,
                 year: _video.year,
                 highRes: true,
-                onBytesLoaded: _updateAmbientFromBytes,
+                onBytesLoaded: _onPosterCardBytesLoaded,
                 placeholder: _posterPlaceholder(bgColor),
               ),
               Positioned.fill(
@@ -3646,6 +3888,26 @@ class _DetailScreenState extends State<DetailScreen> {
         ),
         const SizedBox(height: 10),
         _buildRatingsAndSiteWrap(alignment: WrapAlignment.start),
+        if (!OhosRuntime.isOhos) ...[
+          Builder(
+            builder: (_) {
+              final activeLine = _video.lines.isEmpty
+                  ? null
+                  : _video
+                      .lines[_selectedLine.clamp(0, _video.lines.length - 1)];
+              final specBadges = _specBadgesForHero(activeLine);
+              if (specBadges.isEmpty) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: MediaBadgeRow(
+                  badges: specBadges,
+                  maxBadges: 5,
+                  alignment: WrapAlignment.start,
+                ),
+              );
+            },
+          ),
+        ],
         if (desc.isNotEmpty || cast.isNotEmpty) ...[
           const SizedBox(height: 12),
           GestureDetector(

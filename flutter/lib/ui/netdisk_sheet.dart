@@ -16,6 +16,7 @@ import '../core/netdisk_session.dart';
 import '../core/storage_service.dart';
 import '../core/quark_account.dart';
 import 'apple_theme.dart';
+import 'ios_liquid_glass.dart';
 import 'ios_settings.dart';
 import 'local_qr_code.dart';
 import 'quark_library_sheet.dart';
@@ -50,15 +51,13 @@ Future<void> showNetdiskAccountSheet(
   if (defaultTargetPlatform == TargetPlatform.iOS) {
     await Navigator.of(context).push<void>(
       buildApplePageRoute<void>(
-        builder: (_) => IosSettingsScaffold(
-          title: '我的云盘',
-          backLabel: iosBackLabel,
-          body: _NetdiskAccountSheet(
-            storage: storage,
-            initialDriveKey: initialDriveKey,
-            onChanged: onChanged,
-            service: service,
-          ),
+        builder: (_) => _NetdiskAccountSheet(
+          storage: storage,
+          initialDriveKey: initialDriveKey,
+          onChanged: onChanged,
+          service: service,
+          embedInIosScaffold: true,
+          iosBackLabel: iosBackLabel,
         ),
       ),
     );
@@ -81,12 +80,16 @@ class _NetdiskAccountSheet extends StatefulWidget {
   final String? initialDriveKey;
   final VoidCallback? onChanged;
   final NetdiskService? service;
+  final bool embedInIosScaffold;
+  final String iosBackLabel;
 
   const _NetdiskAccountSheet({
     required this.storage,
     this.initialDriveKey,
     this.onChanged,
     this.service,
+    this.embedInIosScaffold = false,
+    this.iosBackLabel = '返回',
   });
 
   @override
@@ -106,6 +109,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
   int? _pollingAttempt;
   bool _foreground = true;
   bool _resumedImmediateRetry = false;
+  int _selectedDriveFilter = 0;
 
   @override
   void initState() {
@@ -714,70 +718,181 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
             ],
           ]);
     }
-    return SingleChildScrollView(
-      key: const ValueKey('netdisk-account-sheet'),
-      padding: const EdgeInsets.fromLTRB(20, 12, 20, 28),
+    final useNativeIos26 = IosLiquidGlassBridge.isAvailable;
+    final safeBottom = MediaQuery.paddingOf(context).bottom;
+    final bannerCard = AppleSettingsGlassCard(
+      padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
+      borderRadius: BorderRadius.circular(18),
       child: Column(
-        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // Priority Order Banner (matches TV's `盘序: 夸父>优汐>嘟嘟>阿狸`)
-          AppleGlassSurface(
-            padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 12),
-            borderRadius: BorderRadius.circular(18),
-            color: const Color(0x9926262E),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    const Icon(
-                      CupertinoIcons.arrow_up_arrow_down_circle_fill,
-                      color: AppleColors.systemBlue,
-                      size: 19,
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        '盘序优先：$orderLabels',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 13.5,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    AppleCapsuleButton(
-                      icon: CupertinoIcons.refresh,
-                      label: '切换盘序',
-                      compact: true,
-                      onPressed: _rotateDriveOrder,
-                    ),
-                  ],
+          Row(
+            children: [
+              const Icon(
+                CupertinoIcons.arrow_up_arrow_down_circle_fill,
+                color: AppleColors.systemBlue,
+                size: 19,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '盘序优先：$orderLabels',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 13.5,
+                    fontWeight: FontWeight.w700,
+                  ),
                 ),
-                const SizedBox(height: 6),
-                const Text(
-                  '与电视端「🗂我的云盘┃配置」保持一致，支持优汐智1 / 夸父智1 / 嘟嘟无限2 / 阿狸原画',
-                  style: TextStyle(color: Color(0x99EBEBF5), fontSize: 11.5),
+              ),
+              if (!widget.embedInIosScaffold || !useNativeIos26) ...[
+                const SizedBox(width: 8),
+                AppleCapsuleButton(
+                  icon: CupertinoIcons.refresh,
+                  label: '切换盘序',
+                  compact: true,
+                  useBackdrop: false,
+                  onPressed: _rotateDriveOrder,
                 ),
               ],
-            ),
+            ],
           ),
-          const SizedBox(height: 14),
+          const SizedBox(height: 6),
+          const Text(
+            '与电视端「🗂我的云盘┃配置」保持一致，支持优汐智1 / 夸父智1 / 嘟嘟无限2 / 阿狸原画',
+            style: TextStyle(color: Color(0x99EBEBF5), fontSize: 11.5),
+          ),
+        ],
+      ),
+    );
 
-          // Active QR Code Scanner Box if a drive is selected
-          if (_activeQrDriveKey != null) ...[
-            _buildQrScannerCard(_driveByKey(_activeQrDriveKey!)),
-            const SizedBox(height: 16),
+    final scrollList = RepaintBoundary(
+      child: SingleChildScrollView(
+        padding: EdgeInsets.fromLTRB(
+          20,
+          useNativeIos26 ? 2 : 12,
+          20,
+          (widget.embedInIosScaffold ? safeBottom : 0) + 28,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            bannerCard,
+            const SizedBox(height: 14),
+            // Active QR Code Scanner Box if a drive is selected
+            if (_activeQrDriveKey != null) ...[
+              _buildQrScannerCard(_driveByKey(_activeQrDriveKey!)),
+              const SizedBox(height: 16),
+            ],
+            // 4 Netdisk Drives List (filtered when a specific drive segment is active on iOS 26+)
+            for (var i = 0; i < NetdiskService.drives.length; i++)
+              if (_selectedDriveFilter == 0 || _selectedDriveFilter == i + 1) ...[
+                _buildDriveTile(NetdiskService.drives[i]),
+                const SizedBox(height: 10),
+              ],
           ],
+        ),
+      ),
+    );
 
-          // 4 Netdisk Drives List
-          for (final drive in NetdiskService.drives) ...[
-            _buildDriveTile(drive),
-            const SizedBox(height: 10),
-          ],
+    final Widget bodyContent = useNativeIos26
+        ? Column(
+            key: const ValueKey('netdisk-account-sheet'),
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Keep native UISegmentedControl pinned outside the scroll view & away from
+              // any BackdropFilter; matching 36pt fallback prevents layout shift during push.
+              Padding(
+                padding: const EdgeInsets.fromLTRB(20, 8, 20, 10),
+                child: IosNativeSegmentedControl(
+                  segments: const ['全部', '夸克', 'UC', '百度', '阿狸'],
+                  selectedIndex: _selectedDriveFilter,
+                  height: 36,
+                  onChanged: (idx) => setState(() => _selectedDriveFilter = idx),
+                  fallback: _buildFallbackDriveSegments(),
+                ),
+              ),
+              Flexible(child: scrollList),
+            ],
+          )
+        : KeyedSubtree(
+            key: const ValueKey('netdisk-account-sheet'),
+            child: scrollList,
+          );
+
+    if (widget.embedInIosScaffold) {
+      return IosSettingsScaffold(
+        title: '我的云盘',
+        backLabel: widget.iosBackLabel,
+        trailing: useNativeIos26
+            ? IosNativeGlassButton(
+                style: 'capsule',
+                symbol: 'arrow.triangle.2.circlepath',
+                label: '切换盘序',
+                symbolSize: 13,
+                height: 36,
+                maxWidth: 108,
+                accessibilityLabel: '切换盘序',
+                onTap: _rotateDriveOrder,
+                fallback: AppleCapsuleButton(
+                  icon: CupertinoIcons.refresh,
+                  label: '切换盘序',
+                  compact: true,
+                  useBackdrop: false,
+                  onPressed: _rotateDriveOrder,
+                ),
+              )
+            : null,
+        body: bodyContent,
+      );
+    }
+    return bodyContent;
+  }
+
+  Widget _buildFallbackDriveSegments() {
+    const labels = ['全部', '夸克', 'UC', '百度', '阿狸'];
+    return Container(
+      height: 36,
+      padding: const EdgeInsets.all(2.5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1C1C22),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: Colors.white.withValues(alpha: 0.08),
+          width: 0.6,
+        ),
+      ),
+      child: Row(
+        children: [
+          for (var i = 0; i < labels.length; i++)
+            Expanded(
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: () => setState(() => _selectedDriveFilter = i),
+                child: Container(
+                  alignment: Alignment.center,
+                  decoration: i == _selectedDriveFilter
+                      ? BoxDecoration(
+                          color: const Color(0xFF484852),
+                          borderRadius: BorderRadius.circular(15.5),
+                        )
+                      : null,
+                  child: Text(
+                    labels[i],
+                    maxLines: 1,
+                    style: TextStyle(
+                      color: i == _selectedDriveFilter
+                          ? Colors.white
+                          : const Color(0xB8EBEBF5),
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -909,6 +1024,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                 icon: CupertinoIcons.arrow_clockwise,
                 label: '刷新二维码',
                 compact: true,
+                useBackdrop: false,
                 onPressed: () => _startQrLogin(drive.key),
               ),
               AppleCapsuleButton(
@@ -916,6 +1032,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                 icon: CupertinoIcons.arrow_up_right_square,
                 label: '本机跳转授权',
                 compact: true,
+                useBackdrop: false,
                 onPressed: () => _openSameDeviceAuth(drive, qrData),
               ),
               if (drive.key == 'ali')
@@ -924,18 +1041,21 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                   icon: CupertinoIcons.viewfinder,
                   label: 'App相册扫码',
                   compact: true,
+                  useBackdrop: false,
                   onPressed: () => _shareQrAndOpenAliApp(qrData, drive),
                 ),
               AppleCapsuleButton(
                 icon: CupertinoIcons.square_arrow_up,
                 label: '保存/分享二维码',
                 compact: true,
+                useBackdrop: false,
                 onPressed: () => _shareQrImage(qrData, drive),
               ),
               AppleCapsuleButton(
                 icon: CupertinoIcons.doc_on_clipboard,
                 label: '复制授权链接',
                 compact: true,
+                useBackdrop: false,
                 onPressed: () {
                   if (qrData.isEmpty) return;
                   Clipboard.setData(ClipboardData(text: qrData));
@@ -1084,6 +1204,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
               icon: CupertinoIcons.folder,
               label: '浏览网盘视频',
               compact: true,
+              useBackdrop: false,
               onPressed: () {
                 setState(_cancelQr);
                 showQuarkLibrarySheet(context, widget.storage);
@@ -1102,6 +1223,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                   label: loggedIn ? '重新扫码' : '扫码登录',
                   primary: !loggedIn,
                   compact: true,
+                  useBackdrop: false,
                   onPressed: () => _startQrLogin(drive.key),
                 ),
               ),
@@ -1111,6 +1233,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                   icon: CupertinoIcons.pencil,
                   label: '手动配置 Token',
                   compact: true,
+                  useBackdrop: false,
                   onPressed: () => _showManualInputDialog(drive.key),
                 ),
               ),
@@ -1121,6 +1244,7 @@ class _NetdiskAccountSheetState extends State<_NetdiskAccountSheet>
                   label: '退出',
                   destructive: true,
                   compact: true,
+                  useBackdrop: false,
                   onPressed: () async {
                     setState(_cancelQr);
                     try {

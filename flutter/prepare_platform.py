@@ -9,6 +9,7 @@ import subprocess
 import sys
 ROOT = Path(__file__).resolve().parent
 REPO_ROOT = ROOT.parent
+IOS_LIQUID_GLASS_SWIFT_PATH = Path(__file__).resolve().parent / "ios_native" / "MarcoLiquidGlass.swift"
 LOGO_MARK = REPO_ROOT / "android" / "src" / "main" / "res" / "drawable-nodpi" / "logo_mark.png"
 OPAQUE_ICON = REPO_ROOT / "docs" / "images" / "app-icon-512.png"
 MACOS_ICON_DIR = ROOT / "brand" / "macos"
@@ -1044,6 +1045,11 @@ def main() -> None:
                         assets_dir / 'js-host' / name)
     if LOGO_MARK.exists():
         shutil.copy2(LOGO_MARK, assets_dir / "logo_mark.png")
+    badge_rules = REPO_ROOT / "shared" / "ui-spec" / "badge-rules.json"
+    if badge_rules.exists():
+        ui_spec_dir = assets_dir / "ui-spec"
+        ui_spec_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(badge_rules, ui_spec_dir / "badge-rules.json")
     widget_test = ROOT / "test" / "widget_test.dart"
     if widget_test.exists():
         widget_test.unlink()
@@ -1180,7 +1186,7 @@ def main() -> None:
                 'CFBundleDisplayName': 'Marco Movie',
                 'CFBundleAllowMixedLocalizations': True,
                 'UIStatusBarStyle': 'UIStatusBarStyleLightContent',
-                'UIViewControllerBasedStatusBarAppearance': False,
+                'UIViewControllerBasedStatusBarAppearance': True,
                 'NSLocalNetworkUsageDescription': '连接你添加的局域网 Emby 服务器及片源。',
                 'UIFileSharingEnabled': True,
                 'LSSupportsOpeningDocumentsInPlace': True,
@@ -1214,6 +1220,15 @@ def main() -> None:
             info['CFBundleURLTypes'] = url_types
             info.setdefault('NSAppTransportSecurity', {})['NSAllowsArbitraryLoads'] = True
             ios_plist.write_bytes(plistlib.dumps(info, sort_keys=False))
+        ios_storyboard = ios_runner / "Base.lproj" / "Main.storyboard"
+        if ios_storyboard.exists():
+            sb_text = ios_storyboard.read_text(encoding="utf-8")
+            if 'customClass="FlutterViewController"' in sb_text:
+                sb_text = sb_text.replace(
+                    'customClass="FlutterViewController"',
+                    'customClass="MarcoFlutterViewController" customModule="Runner" customModuleProvider="target"',
+                )
+                ios_storyboard.write_text(sb_text, encoding="utf-8")
         ios_app_delegate = ios_runner / "AppDelegate.swift"
         if ios_app_delegate.exists():
             ad_text = ios_app_delegate.read_text(encoding="utf-8")
@@ -1241,6 +1256,65 @@ def main() -> None:
                     1,
                 )
                 ad_changed = True
+            if "marco_movie/system_chrome" not in ad_text and "if let controller = window?.rootViewController as? FlutterViewController {" in ad_text:
+                ad_text = ad_text.replace(
+                    "    if let controller = window?.rootViewController as? FlutterViewController {",
+                    "    if let controller = window?.rootViewController as? FlutterViewController {\n"
+                    "      let systemChromeChannel = FlutterMethodChannel(name: \"marco_movie/system_chrome\", binaryMessenger: controller.binaryMessenger)\n"
+                    "      systemChromeChannel.setMethodCallHandler { [weak controller] call, result in\n"
+                    "        if call.method == \"setImmersive\", let immersive = call.arguments as? Bool {\n"
+                    "          DispatchQueue.main.async {\n"
+                    "            if let marcoVC = controller as? MarcoFlutterViewController {\n"
+                    "              marcoVC.marcoImmersiveMode = immersive\n"
+                    "            } else {\n"
+                    "              controller?.setNeedsStatusBarAppearanceUpdate()\n"
+                    "              if #available(iOS 11.0, *) {\n"
+                    "                controller?.setNeedsUpdateOfHomeIndicatorAutoHidden()\n"
+                    "                controller?.setNeedsUpdateOfScreenEdgesDeferringSystemGestures()\n"
+                    "              }\n"
+                    "            }\n"
+                    "            result(nil)\n"
+                    "          }\n"
+                    "        } else {\n"
+                    "          result(FlutterMethodNotImplemented)\n"
+                    "        }\n"
+                    "      }",
+                    1,
+                )
+                ad_changed = True
+            if "final class MarcoFlutterViewController" not in ad_text:
+                ad_text = (
+                    ad_text.rstrip()
+                    + "\n\n@objc(MarcoFlutterViewController)\n"
+                    "final class MarcoFlutterViewController: FlutterViewController {\n"
+                    "  var marcoImmersiveMode: Bool = false {\n"
+                    "    didSet {\n"
+                    "      guard oldValue != marcoImmersiveMode else { return }\n"
+                    "      setNeedsStatusBarAppearanceUpdate()\n"
+                    "      if #available(iOS 11.0, *) {\n"
+                    "        setNeedsUpdateOfHomeIndicatorAutoHidden()\n"
+                    "        setNeedsUpdateOfScreenEdgesDeferringSystemGestures()\n"
+                    "      }\n"
+                    "    }\n"
+                    "  }\n\n"
+                    "  override var preferredStatusBarStyle: UIStatusBarStyle {\n"
+                    "    return .lightContent\n"
+                    "  }\n\n"
+                    "  override var prefersStatusBarHidden: Bool {\n"
+                    "    return marcoImmersiveMode || super.prefersStatusBarHidden\n"
+                    "  }\n\n"
+                    "  override var preferredStatusBarUpdateAnimation: UIStatusBarAnimation {\n"
+                    "    return .fade\n"
+                    "  }\n\n"
+                    "  override var prefersHomeIndicatorAutoHidden: Bool {\n"
+                    "    return marcoImmersiveMode\n"
+                    "  }\n\n"
+                    "  override var preferredScreenEdgesDeferringSystemGestures: UIRectEdge {\n"
+                    "    return marcoImmersiveMode ? [.top, .bottom] : []\n"
+                    "  }\n"
+                    "}\n"
+                )
+                ad_changed = True
             if "marco_movie/netdisk_auth" not in ad_text and "if let controller = window?.rootViewController as? FlutterViewController {" in ad_text:
                 ad_text = ad_text.replace(
                     "    if let controller = window?.rootViewController as? FlutterViewController {",
@@ -1261,6 +1335,19 @@ def main() -> None:
             if "private final class HeadlessMediaWebSniffer" not in ad_text:
                 ad_text = ad_text.rstrip() + "\n" + APPLE_WEB_SNIFFER_SWIFT
                 ad_changed = True
+            if "MarcoLiquidGlassPlugin" not in ad_text and "GeneratedPluginRegistrant.register(with: self)" in ad_text:
+                ad_text = ad_text.replace(
+                    "GeneratedPluginRegistrant.register(with: self)",
+                    "GeneratedPluginRegistrant.register(with: self)\n"
+                    "    if let glassRegistrar = self.registrar(forPlugin: \"MarcoLiquidGlassPlugin\") {\n"
+                    "      MarcoLiquidGlassSupport.register(with: glassRegistrar, messenger: glassRegistrar.messenger())\n"
+                    "    }",
+                    1,
+                )
+                ad_changed = True
+            if "private enum MarcoLiquidGlassSupport" not in ad_text and IOS_LIQUID_GLASS_SWIFT_PATH.is_file():
+                ad_text = ad_text.rstrip() + "\n\n" + IOS_LIQUID_GLASS_SWIFT_PATH.read_text(encoding="utf-8")
+                ad_changed = True
             if ad_changed:
                 ios_app_delegate.write_text(ad_text, encoding="utf-8")
     ios_app_fw_plist = ROOT / "ios" / "Flutter" / "AppFrameworkInfo.plist"
@@ -1268,7 +1355,7 @@ def main() -> None:
         text = ios_app_fw_plist.read_text(encoding="utf-8")
         text = re.sub(
             r"(<key>MinimumOSVersion</key>\s*<string>)[^<]+(</string>)",
-            r"\g<1>14.0\g<2>",
+            r"\g<1>15.0\g<2>",
             text,
         )
         ios_app_fw_plist.write_text(text, encoding="utf-8")
@@ -1276,20 +1363,25 @@ def main() -> None:
         xcconfig = ROOT / "ios" / "Flutter" / xcconfig_name
         if xcconfig.exists():
             text = xcconfig.read_text(encoding="utf-8")
-            if "no_fixup_chains" not in text:
-                text = (
-                    text.rstrip()
-                    + "\nIPHONEOS_DEPLOYMENT_TARGET = 14.0\n"
-                    + "OTHER_LDFLAGS = $(inherited) -Wl,-no_fixup_chains\n"
-                    + "OTHER_CFLAGS = $(inherited) -fno-objc-msgsend-selector-stubs\n"
-                )
-                xcconfig.write_text(text, encoding="utf-8")
+            text = re.sub(
+                r"(?m)^IPHONEOS_DEPLOYMENT_TARGET\s*=.*$",
+                "IPHONEOS_DEPLOYMENT_TARGET = 15.0",
+                text,
+            )
+            text = re.sub(
+                r"(?m)^OTHER_LDFLAGS\s*=\s*\$\(inherited\)\s+-Wl,-no_fixup_chains\s*$\n?",
+                "",
+                text,
+            )
+            if "IPHONEOS_DEPLOYMENT_TARGET = 15.0" not in text:
+                text = text.rstrip() + "\nIPHONEOS_DEPLOYMENT_TARGET = 15.0\n"
+            xcconfig.write_text(text, encoding="utf-8")
     ios_pbx = ROOT / "ios" / "Runner.xcodeproj" / "project.pbxproj"
     if ios_pbx.exists():
         text = ios_pbx.read_text(encoding="utf-8")
         text = re.sub(
             r"IPHONEOS_DEPLOYMENT_TARGET\s*=\s*[0-9.]+;",
-            "IPHONEOS_DEPLOYMENT_TARGET = 14.0;",
+            "IPHONEOS_DEPLOYMENT_TARGET = 15.0;",
             text,
         )
         ios_pbx.write_text(text, encoding="utf-8")
@@ -1298,26 +1390,16 @@ def main() -> None:
         text = ios_podfile.read_text(encoding="utf-8")
         text = re.sub(
             r"#?\s*platform\s+:ios\s*,\s*'[^']+'",
-            "platform :ios, '14.0'",
+            "platform :ios, '15.0'",
             text,
         )
-        if "no_fixup_chains" not in text and "flutter_additional_ios_build_settings(target)" in text:
+        if "Gem::Version.new('15.0')" not in text and "flutter_additional_ios_build_settings(target)" in text:
             text = text.replace(
                 "flutter_additional_ios_build_settings(target)",
                 "flutter_additional_ios_build_settings(target)\n"
                 "    target.build_configurations.each do |config|\n"
-                "      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '14.0' if Gem::Version.new(config.build_settings.fetch('IPHONEOS_DEPLOYMENT_TARGET', '0')) < Gem::Version.new('14.0')\n"
-                "      config.build_settings['OTHER_LDFLAGS'] = (['$(inherited)'] + Array(config.build_settings['OTHER_LDFLAGS']) + ['-Wl,-no_fixup_chains']).uniq\n"
-                "      config.build_settings['OTHER_CFLAGS'] = (['$(inherited)'] + Array(config.build_settings['OTHER_CFLAGS']) + ['-fno-objc-msgsend-selector-stubs']).uniq\n"
+                "      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0' if Gem::Version.new(config.build_settings.fetch('IPHONEOS_DEPLOYMENT_TARGET', '0')) < Gem::Version.new('15.0')\n"
                 "    end",
-            )
-        # Upgrade an already generated Podfile as well as a fresh runner. Keep
-        # CocoaPods' explicit Flutter/NodeMobile framework link arguments.
-        for key, flag in (("OTHER_LDFLAGS", "-Wl,-no_fixup_chains"),
-                          ("OTHER_CFLAGS", "-fno-objc-msgsend-selector-stubs")):
-            text = text.replace(
-                f"config.build_settings['{key}'] = '$(inherited) {flag}'",
-                f"config.build_settings['{key}'] = (['$(inherited)'] + Array(config.build_settings['{key}']) + ['{flag}']).uniq",
             )
         ios_podfile.write_text(text, encoding="utf-8")
     # Windows icon, working directory, immediate window show, and title

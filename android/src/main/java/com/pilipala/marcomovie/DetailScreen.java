@@ -35,6 +35,10 @@ final class DetailScreen {
 
     static void show(MainActivity a, Cms.Site s, Cms.Video listing, Cms.Video ready) {
         if (a.redirectListing(s, listing)) return;
+        if (a.isTvDevice()) {
+            TvDetailHost.show(a, s, listing, ready);
+            return;
+        }
         a.renderPage("", "", false);
         a.body.setPadding(0, 0, 0, 0);
         a.body.setClipChildren(false);
@@ -42,7 +46,14 @@ final class DetailScreen {
 
         final ImmersivePoster cover = new ImmersivePoster(a, "detail-cover");
         cover.immersiveMode = true;
+        cover.backdrop.setTag("detail-backdrop");
         a.root.addView(cover.backdrop, 1, new FrameLayout.LayoutParams(-1, -1));
+        android.graphics.Rect pendingOrigin = a.consumePendingDetailOrigin();
+        if (pendingOrigin != null) {
+            a.activeTransition =
+                    PlayerTransitionHelper.animateSharedBoundsEnter(
+                            a.root, cover.backdrop, pendingOrigin, a.reduced, null);
+        }
         // Invisible fixed carrier in root keeps detail-cover bounds & decode policy active
         // without rendering any boxed poster card on screen.
         FrameLayout.LayoutParams coverLp =
@@ -389,23 +400,26 @@ final class DetailScreen {
         return false;
     }
 
+    static boolean toggleFavorite(MainActivity a, Cms.Site site, Cms.Video video) {
+        a.prefs
+                .edit()
+                .putString(
+                        Prefs.FAVORITES,
+                        Favorites.toggle(a.prefs.getString(Prefs.FAVORITES, "[]"), site.key, video))
+                .apply();
+        boolean selected =
+                Favorites.contains(a.prefs.getString(Prefs.FAVORITES, "[]"), site.key, video.id);
+        CloudSyncDialog.onFavoriteToggled(a, site.key, video.id, selected);
+        return selected;
+    }
+
     static void bindFavoriteAction(MainActivity a, Cms.Site s, Cms.Video v, Button favorite) {
         boolean isFav = Favorites.contains(a.prefs.getString(Prefs.FAVORITES, "[]"), s.key, v.id);
         favorite.setText(isFav ? "♥ 已收藏" : "♡ 加入收藏");
         styleGlassButton(a, favorite, favorite.hasFocus(), isFav);
         favorite.setOnClickListener(
                 view -> {
-                    a.prefs
-                            .edit()
-                            .putString(
-                                    Prefs.FAVORITES,
-                                    Favorites.toggle(
-                                            a.prefs.getString(Prefs.FAVORITES, "[]"), s.key, v))
-                            .apply();
-                    boolean nowFav =
-                            Favorites.contains(
-                                    a.prefs.getString(Prefs.FAVORITES, "[]"), s.key, v.id);
-                    CloudSyncDialog.onFavoriteToggled(a, s.key, v.id, nowFav);
+                    boolean nowFav = toggleFavorite(a, s, v);
                     favorite.setText(nowFav ? "♥ 已收藏" : "♡ 加入收藏");
                     styleGlassButton(a, favorite, favorite.hasFocus(), nowFav);
                 });
@@ -456,12 +470,13 @@ final class DetailScreen {
         if (focused) {
             d.setColor(MainActivity.WHITE);
             b.setTextColor(MainActivity.DARK);
-            b.animate().scaleX(1.04f).scaleY(1.04f).setDuration(130).start();
+            float scale = a.reduced ? 1f : 1.04f;
+            b.animate().scaleX(scale).scaleY(scale).setDuration(a.reduced ? 0 : 130).start();
         } else {
             d.setColor(activeAccent ? 0xcc3a4e68 : 0x781c202c);
             d.setStroke(Math.max(1, a.dp(1)), activeAccent ? 0x8082b4ff : 0x38ffffff);
             b.setTextColor(MainActivity.WHITE);
-            b.animate().scaleX(1f).scaleY(1f).setDuration(130).start();
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 130).start();
         }
         b.setBackground(d);
         b.setPadding(pl, pt, pr, pb);
@@ -501,12 +516,13 @@ final class DetailScreen {
         if (focused) {
             d.setColor(MainActivity.WHITE);
             b.setTextColor(0xff090c14);
-            b.animate().scaleX(1.05f).scaleY(1.05f).setDuration(140).start();
+            float scale = a.reduced ? 1f : 1.05f;
+            b.animate().scaleX(scale).scaleY(scale).setDuration(a.reduced ? 0 : 140).start();
         } else {
             d.setColor(0xd8ffffff);
             d.setStroke(Math.max(1, a.dp(1)), 0x66ffffff);
             b.setTextColor(0xff0c101a);
-            b.animate().scaleX(1f).scaleY(1f).setDuration(140).start();
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 140).start();
         }
         b.setBackground(d);
         b.setPadding(a.dp(32), a.dp(9), a.dp(32), a.dp(9));
@@ -631,6 +647,82 @@ final class DetailScreen {
         return sb.toString();
     }
 
+    private static void styleAppleShelfPill(
+            MainActivity a, Button b, boolean focused, boolean selected) {
+        FocusMotion.unclipAncestors(b);
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(a.dp(19));
+        if (focused) {
+            d.setColor(0xfff5f5f7);
+            d.setStroke(Math.max(1, a.dp(1)), 0xffffffff);
+            b.setTextColor(0xff0b0e14);
+            b.setTypeface(null, Typeface.BOLD);
+            float scale = a.reduced ? 1f : 1.035f;
+            b.animate().scaleX(scale).scaleY(scale).setDuration(a.reduced ? 0 : 130).start();
+        } else if (selected) {
+            d.setColor(0x36ffffff);
+            d.setStroke(Math.max(1, a.dp(1)), 0x70ffffff);
+            b.setTextColor(0xfff5f5f7);
+            b.setTypeface(null, Typeface.BOLD);
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 130).start();
+        } else {
+            d.setColor(0x16ffffff);
+            d.setStroke(Math.max(1, a.dp(1)), 0x22ffffff);
+            b.setTextColor(0xd2ebebf5);
+            b.setTypeface(null, Typeface.NORMAL);
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 130).start();
+        }
+        b.setBackground(d);
+        b.setPadding(a.dp(16), a.dp(7), a.dp(16), a.dp(7));
+    }
+
+    private static void styleAppleEpisodeCard(
+            MainActivity a, Button b, boolean focused, boolean activeBookmark) {
+        FocusMotion.unclipAncestors(b);
+        GradientDrawable d = new GradientDrawable();
+        d.setShape(GradientDrawable.RECTANGLE);
+        d.setCornerRadius(a.dp(13));
+        if (focused) {
+            d.setColor(0xfff5f5f7);
+            d.setStroke(Math.max(1, a.dp(1)), 0xffffffff);
+            b.setTextColor(0xff0b0e14);
+            b.setTypeface(null, Typeface.BOLD);
+            float scale = a.reduced ? 1f : 1.03f;
+            b.animate().scaleX(scale).scaleY(scale).setDuration(a.reduced ? 0 : 130).start();
+        } else if (activeBookmark) {
+            d.setColor(0x340a84ff);
+            d.setStroke(Math.max(1, a.dp(1)), 0x883898ff);
+            b.setTextColor(0xfff5f5f7);
+            b.setTypeface(null, Typeface.BOLD);
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 130).start();
+        } else {
+            d.setColor(0x1effffff);
+            d.setStroke(Math.max(1, a.dp(1)), 0x20ffffff);
+            b.setTextColor(0xedf5f5f7);
+            b.setTypeface(null, Typeface.NORMAL);
+            b.animate().scaleX(1f).scaleY(1f).setDuration(a.reduced ? 0 : 130).start();
+        }
+        b.setBackground(d);
+        b.setPadding(a.dp(13), a.dp(10), a.dp(13), a.dp(10));
+    }
+
+    private static Button makeCompactShelfAction(
+            MainActivity a, String label, String tag, boolean active, Runnable action) {
+        final Button b = a.button(label, tag, action);
+        b.setSingleLine(true);
+        b.setEllipsize(TextUtils.TruncateAt.END);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f);
+        b.setMinHeight(a.dp(34));
+        b.setMinimumHeight(a.dp(34));
+        b.setSelected(active);
+        styleAppleShelfPill(a, b, false, active);
+        b.setOnFocusChangeListener((v, focus) -> styleAppleShelfPill(a, b, focus, b.isSelected()));
+        return b;
+    }
+
     static void renderEpisodes(
             MainActivity a,
             Cms.Site site,
@@ -647,32 +739,58 @@ final class DetailScreen {
         panel.removeAllViews();
         Cms.Line line = video.lines.get(lineIndex);
         final boolean descending = a.prefs.getBoolean(Prefs.EPISODES_DESCENDING, false);
+        WatchHistory.Entry currentBookmark = null;
+        for (WatchHistory.Entry entry : a.watchHistory()) {
+            if (entry.site.equals(site.key) && entry.id.equals(video.id)) {
+                currentBookmark = entry;
+                break;
+            }
+        }
+        final String bookmarkedEpisode =
+                currentBookmark != null && line.name.equals(currentBookmark.line)
+                        ? currentBookmark.episode
+                        : "";
 
-        // 1. Inline Playback Line Switcher Section
+        // 1. Minimalist Apple Line Switcher Header
         LinearLayout lineHeader = a.row();
         lineHeader.setGravity(Gravity.CENTER_VERTICAL);
-        lineHeader.setPadding(a.dp(4), a.dp(4), a.dp(4), a.dp(6));
-        TextView lineTitle = a.text("播放线路", 16, MainActivity.WHITE);
+        lineHeader.setPadding(a.dp(2), a.dp(2), a.dp(2), a.dp(10));
+        TextView lineTitle = a.text("播放线路", 15, 0xfff5f5f7);
         lineTitle.setTypeface(null, Typeface.BOLD);
         lineHeader.addView(lineTitle);
-        TextView lineSub = a.text("  " + video.lines.size() + " 条可用线路", 12, MainActivity.MUTED);
+        TextView lineSub = a.text("  " + video.lines.size() + " 条线路", 12, 0x8cebebf5);
         lineHeader.addView(lineSub, new LinearLayout.LayoutParams(0, -2, 1f));
         Button prefLineBtn =
-                a.navButton(
-                        "默认播放线路", "line-preferred", () -> SourcePreferences.chooseLine(a, video));
+                makeCompactShelfAction(
+                        a,
+                        "默认线路",
+                        "line-preferred",
+                        false,
+                        () -> SourcePreferences.chooseLine(a, video));
         lineHeader.addView(prefLineBtn);
         panel.addView(lineHeader, new LinearLayout.LayoutParams(-1, -2));
 
         CategoryFlow sources = new CategoryFlow(a, () -> {});
         sources.setTag("detail-line-buttons");
-        sources.setPadding(a.dp(2), a.dp(2), a.dp(2), a.dp(12));
+        sources.setClipChildren(false);
+        sources.setClipToPadding(false);
+        sources.setPadding(a.dp(2), a.dp(2), a.dp(2), a.dp(10));
         panel.addView(sources, new LinearLayout.LayoutParams(-1, -2));
         for (int n = 0; n < video.lines.size(); n++) {
             final int index = n;
             final boolean selected = n == lineIndex;
+            final Cms.Line candidateLine = video.lines.get(n);
+            final java.util.List<MediaBadges.Badge> lineBadges =
+                    MediaBadgeView.extractForLineOnly(a, candidateLine, null);
+            final String lineSpec =
+                    MediaBadges.formatDotJoined(lineBadges, MediaBadgeView.LINE_PICKER_MAX_BADGES);
+            final String lineBaseLabel =
+                    lineSpec.isEmpty()
+                            ? candidateLine.name
+                            : (candidateLine.name + " · " + lineSpec);
             final Button choice =
                     a.button(
-                            video.lines.get(n).name,
+                            selected ? "● " + lineBaseLabel : lineBaseLabel,
                             "detail-line:" + n,
                             () -> {
                                 renderEpisodes(a, site, video, index, 0, panel, null);
@@ -689,6 +807,27 @@ final class DetailScreen {
                                                         video.lines.get(index).episodes.get(0));
                                             });
                                 }
+                                View epFile = a.root.findViewWithTag("detail-episode-file");
+                                if (epFile instanceof TextView
+                                        && !video.lines.get(index).episodes.isEmpty()) {
+                                    String cap =
+                                            TvV17DetailScreen.formatEpisodeFileCaption(
+                                                    video.lines.get(index),
+                                                    video.lines.get(index).episodes.get(0));
+                                    ((TextView) epFile).setText(cap);
+                                    epFile.setVisibility(cap.isEmpty() ? View.GONE : View.VISIBLE);
+                                }
+                                View heroSpec = a.root.findViewWithTag("detail-spec-badges");
+                                if (heroSpec instanceof ViewGroup) {
+                                    MediaBadgeView.populateRow(
+                                            a,
+                                            (ViewGroup) heroSpec,
+                                            MediaBadgeView.extractForHero(
+                                                    a, video.remarks, video.lines.get(index), null),
+                                            MediaBadgeView.HERO_MAX_BADGES,
+                                            false,
+                                            a.isTvDevice());
+                                }
                                 View next = panel.findViewWithTag("detail-line:" + index);
                                 if (next != null) next.requestFocus();
                             });
@@ -697,11 +836,10 @@ final class DetailScreen {
             choice.setEllipsize(TextUtils.TruncateAt.END);
             choice.setMinWidth(0);
             choice.setMinimumWidth(0);
-            choice.setTextSize(13);
+            choice.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
             choice.setMinHeight(a.dp(36));
             choice.setMinimumHeight(a.dp(36));
-            choice.setBackground(a.bg(selected ? 0xff3b5472 : 0x991c202b, 18));
-            choice.setPadding(a.dp(15), a.dp(7), a.dp(15), a.dp(7));
+            styleAppleShelfPill(a, choice, false, selected);
             choice.setOnKeyListener(
                     (v, keyCode, event) -> {
                         FocusMotion.key(a, v, keyCode, event);
@@ -714,18 +852,7 @@ final class DetailScreen {
                     });
             choice.setOnFocusChangeListener(
                     (view, focus) -> {
-                        FocusMotion.style(
-                                a,
-                                choice,
-                                focus,
-                                selected ? 0xff3b5472 : 0x991c202b,
-                                MainActivity.WHITE,
-                                18,
-                                MainActivity.WHITE,
-                                MainActivity.DARK,
-                                false,
-                                1.03f);
-                        choice.setPadding(a.dp(15), a.dp(7), a.dp(15), a.dp(7));
+                        styleAppleShelfPill(a, choice, focus, selected);
                         if (focus
                                 && a.isTvDevice()
                                 && !selected
@@ -746,55 +873,107 @@ final class DetailScreen {
             sources.addView(choice);
         }
 
+        // Hairline separator dividing Line Switcher and Episode Grid
+        View divider = new View(a);
+        divider.setBackgroundColor(0x1affffff);
+        LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(-1, Math.max(1, a.dp(1)));
+        divLp.topMargin = a.dp(4);
+        divLp.bottomMargin = a.dp(14);
+        panel.addView(divider, divLp);
+
         // 2. Episode Section Header + Sort + Pagination Controls
         LinearLayout orderRow = a.row();
         orderRow.setGravity(Gravity.CENTER_VERTICAL);
-        orderRow.setPadding(a.dp(4), a.dp(4), a.dp(4), a.dp(8));
+        orderRow.setPadding(a.dp(2), a.dp(0), a.dp(2), a.dp(10));
 
-        TextView epHeader = a.text("选集列表", 17, MainActivity.WHITE);
+        TextView epHeader = a.text("选集", 16, 0xfff5f5f7);
         epHeader.setTypeface(null, Typeface.BOLD);
         orderRow.addView(epHeader);
 
-        TextView count =
-                a.text("   共 " + line.episodes.size() + " 集 · 完整剧集名称直显", 13, MainActivity.MUTED);
+        TextView count = a.text("   共 " + line.episodes.size() + " 集", 12.5f, 0x94ebebf5);
         orderRow.addView(count, new LinearLayout.LayoutParams(0, -2, 1));
 
         Button order =
-                a.navButton(
+                makeCompactShelfAction(
+                        a,
                         descending ? "↓ 倒序" : "↑ 正序",
                         "episodes-order",
+                        descending,
                         () -> {
                             boolean next = !descending;
                             a.prefs.edit().putBoolean(Prefs.EPISODES_DESCENDING, next).apply();
                             renderEpisodes(a, site, video, lineIndex, 0, panel, "episodes-order");
                         });
-        order.setSelected(descending);
         order.setContentDescription("选集排序：" + (descending ? "倒序，点击改为正序" : "正序，点击改为倒序"));
         orderRow.addView(order);
         panel.addView(orderRow, new LinearLayout.LayoutParams(-1, -2));
 
-        int start = page * 50, end = Math.min(start + 50, line.episodes.size());
+        int totalEpisodes = line.episodes.size();
+        int start = page * 50, end = Math.min(start + 50, totalEpisodes);
 
-        // Range pills bar when there are > 50 episodes
-        if (line.episodes.size() > 50) {
+        // Apple TV segmented range pills when there are > 50 episodes
+        if (totalEpisodes > 50) {
+            android.widget.HorizontalScrollView rangeScroll =
+                    new android.widget.HorizontalScrollView(a);
+            rangeScroll.setHorizontalScrollBarEnabled(false);
+            rangeScroll.setClipChildren(false);
+            rangeScroll.setClipToPadding(false);
             LinearLayout pages = a.row();
             pages.setGravity(Gravity.CENTER_VERTICAL);
-            pages.setPadding(a.dp(2), a.dp(2), a.dp(2), a.dp(10));
-            if (page > 0)
-                a.addButton(
-                        pages,
-                        a.navButton(
-                                "上一组",
-                                "episodes-previous",
+            pages.setClipChildren(false);
+            pages.setClipToPadding(false);
+            pages.setPadding(a.dp(2), a.dp(2), a.dp(2), a.dp(12));
+
+            int pageCount = (totalEpisodes + 49) / 50;
+            for (int p = 0; p < pageCount; p++) {
+                final int targetPage = p;
+                int pStart = p * 50 + 1;
+                int pEnd = Math.min((p + 1) * 50, totalEpisodes);
+                String segLabel =
+                        descending
+                                ? (totalEpisodes - pStart + 1) + "–" + (totalEpisodes - pEnd + 1)
+                                : pStart + "–" + pEnd;
+                Button seg =
+                        makeCompactShelfAction(
+                                a,
+                                segLabel,
+                                "episodes-range:" + p,
+                                p == page,
                                 () ->
                                         renderEpisodes(
-                                                a, site, video, lineIndex, page - 1, panel, null)));
-            if (end < line.episodes.size())
-                a.addButton(
-                        pages,
-                        a.navButton(
-                                "下一组",
+                                                a,
+                                                site,
+                                                video,
+                                                lineIndex,
+                                                targetPage,
+                                                panel,
+                                                "episodes-range:" + targetPage));
+                LinearLayout.LayoutParams segLp = new LinearLayout.LayoutParams(-2, a.dp(34));
+                if (p > 0) segLp.leftMargin = a.dp(8);
+                pages.addView(seg, segLp);
+            }
+
+            if (page > 0) {
+                Button prevBtn =
+                        makeCompactShelfAction(
+                                a,
+                                "‹ 上一组",
+                                "episodes-previous",
+                                false,
+                                () ->
+                                        renderEpisodes(
+                                                a, site, video, lineIndex, page - 1, panel, null));
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, a.dp(34));
+                lp.leftMargin = a.dp(10);
+                pages.addView(prevBtn, lp);
+            }
+            if (end < totalEpisodes) {
+                Button nextBtn =
+                        makeCompactShelfAction(
+                                a,
+                                "下一组 ›",
                                 "episodes-next",
+                                false,
                                 () -> {
                                     renderEpisodes(
                                             a, site, video, lineIndex, page + 1, panel, null);
@@ -804,23 +983,26 @@ final class DetailScreen {
                                                             + line.name
                                                             + ":"
                                                             + (descending
-                                                                    ? line.episodes.size() - 1 - end
+                                                                    ? totalEpisodes - 1 - end
                                                                     : end));
                                     if (first != null) first.requestFocus();
-                                }));
-            a.addButton(
-                    pages,
-                    a.navButton(
-                            "全部选集 (" + line.episodes.size() + ")",
+                                });
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, a.dp(34));
+                lp.leftMargin = a.dp(8);
+                pages.addView(nextBtn, lp);
+            }
+            Button allBtn =
+                    makeCompactShelfAction(
+                            a,
+                            "全部 (" + totalEpisodes + ")",
                             "episodes-all",
+                            false,
                             () -> {
-                                String[] labels = new String[line.episodes.size()];
+                                String[] labels = new String[totalEpisodes];
                                 for (int n = 0; n < labels.length; n++)
                                     labels[n] =
                                             line.episodes.get(
-                                                            descending
-                                                                    ? line.episodes.size() - 1 - n
-                                                                    : n)
+                                                            descending ? totalEpisodes - 1 - n : n)
                                                     .name;
                                 new AppDialog.Builder(a)
                                         .setTitle(line.name)
@@ -833,21 +1015,22 @@ final class DetailScreen {
                                                                 line,
                                                                 line.episodes.get(
                                                                         descending
-                                                                                ? line.episodes
-                                                                                                .size()
+                                                                                ? totalEpisodes
                                                                                         - 1
                                                                                         - n
                                                                                 : n)))
                                         .setNegativeButton("取消", null)
                                         .show();
-                            }));
-            TextView rangeHint =
-                    a.text("  当前显示第 " + (start + 1) + " - " + end + " 项", 12, MainActivity.MUTED);
-            pages.addView(rangeHint);
-            panel.addView(pages, new LinearLayout.LayoutParams(-1, -2));
+                            });
+            LinearLayout.LayoutParams allLp = new LinearLayout.LayoutParams(-2, a.dp(34));
+            allLp.leftMargin = a.dp(8);
+            pages.addView(allBtn, allLp);
+
+            rangeScroll.addView(pages, new FrameLayout.LayoutParams(-2, -2));
+            panel.addView(rangeScroll, new LinearLayout.LayoutParams(-1, -2));
         }
 
-        // 3. Full-Title Multi-Line Episode Grid (No separate focused-title bar needed!)
+        // 3. Adaptive Apple-Minimalist Episode Grid
         final int columns = computeColumnsPerRow(line, start, end, descending);
         Object batchToken = new Object();
         panel.setTag(batchToken);
@@ -860,6 +1043,7 @@ final class DetailScreen {
                 site,
                 video,
                 line,
+                bookmarkedEpisode,
                 start,
                 end,
                 columns,
@@ -869,12 +1053,17 @@ final class DetailScreen {
                 a.generation,
                 descending,
                 focusTag);
-        if ("episodes-order".equals(focusTag)) order.requestFocus();
+        if ("episodes-order".equals(focusTag)) {
+            order.requestFocus();
+        } else if (focusTag != null && focusTag.startsWith("episodes-range:")) {
+            View seg = panel.findViewWithTag(focusTag);
+            if (seg != null) seg.requestFocus();
+        }
     }
 
     /**
      * Chooses the optimal number of columns per row on TV so every episode's full name fits
-     * comfortably without truncation.
+     * comfortably without truncation while maintaining clean Apple grid density.
      */
     private static int computeColumnsPerRow(Cms.Line line, int start, int end, boolean descending) {
         int maxLen = 0;
@@ -887,7 +1076,8 @@ final class DetailScreen {
         }
         if (maxLen >= 24) return 3;
         if (maxLen >= 13) return 4;
-        return 5;
+        if (maxLen >= 7) return 5;
+        return 6;
     }
 
     static void appendEpisodeCells(
@@ -895,6 +1085,7 @@ final class DetailScreen {
             Cms.Site site,
             Cms.Video video,
             Cms.Line line,
+            String bookmarkedEpisode,
             int start,
             int end,
             int columns,
@@ -920,17 +1111,21 @@ final class DetailScreen {
             }
             final int originalIndex = descending ? line.episodes.size() - 1 - i : i;
             final Cms.Episode episode = line.episodes.get(originalIndex);
+            final boolean isBookmarked =
+                    bookmarkedEpisode != null
+                            && !bookmarkedEpisode.isEmpty()
+                            && bookmarkedEpisode.equals(episode.name);
+            String label = isBookmarked ? ("● " + episode.name) : episode.name;
             final Button button =
                     a.button(
-                            episode.name,
+                            label,
                             "episode:" + line.name + ":" + originalIndex,
                             () -> {
+                                if (a.appDialog != null) a.appDialog.dismiss();
                                 a.resumeAt = 0;
                                 a.resolvePlayer(site, video, line, episode);
                             });
             button.setContentDescription(episode.name);
-            // Display the COMPLETE episode name directly inside the button (multi-line, no
-            // ellipsis)
             button.setSingleLine(false);
             button.setMaxLines(6);
             button.setEllipsize(null);
@@ -941,23 +1136,12 @@ final class DetailScreen {
                     episode.name != null && episode.name.length() > 12
                             ? (Gravity.START | Gravity.CENTER_VERTICAL)
                             : Gravity.CENTER);
-            button.setMinHeight(a.dp(54));
-            button.setMinimumHeight(a.dp(54));
-            button.setPadding(a.dp(12), a.dp(10), a.dp(12), a.dp(10));
-            button.setBackground(a.bg(0xb81b202c, 12));
+            button.setMinHeight(a.dp(52));
+            button.setMinimumHeight(a.dp(52));
+            styleAppleEpisodeCard(a, button, false, isBookmarked);
             button.setOnFocusChangeListener(
                     (view, focus) -> {
-                        FocusMotion.style(
-                                a,
-                                button,
-                                focus,
-                                0xb81b202c,
-                                MainActivity.WHITE,
-                                12,
-                                MainActivity.WHITE,
-                                MainActivity.DARK,
-                                false,
-                                1.022f);
+                        styleAppleEpisodeCard(a, button, focus, isBookmarked);
                         if (focus && a.current != null) {
                             a.current.episodeFocus = originalIndex;
                             a.current.episodeFocusLine = line.name;
@@ -965,7 +1149,7 @@ final class DetailScreen {
                     });
             LinearLayout.LayoutParams cell =
                     new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            cell.setMargins(a.dp(4), a.dp(4), a.dp(4), a.dp(6));
+            cell.setMargins(a.dp(5), a.dp(5), a.dp(5), a.dp(6));
             row.addView(button, cell);
             if (focusTag != null && focusTag.equals(button.getTag())) button.requestFocus();
         }
@@ -975,7 +1159,7 @@ final class DetailScreen {
                 for (int n = rem; n < columns; n++) {
                     View spacer = new View(a);
                     LinearLayout.LayoutParams sp = new LinearLayout.LayoutParams(0, 1, 1f);
-                    sp.setMargins(a.dp(4), a.dp(4), a.dp(4), a.dp(6));
+                    sp.setMargins(a.dp(5), a.dp(5), a.dp(5), a.dp(6));
                     row.addView(spacer, sp);
                 }
             }
@@ -984,7 +1168,7 @@ final class DetailScreen {
         for (final LinearLayout createdRow : createdRows) {
             createdRow.post(
                     () -> {
-                        int maxH = a.dp(54);
+                        int maxH = a.dp(52);
                         for (int c = 0; c < createdRow.getChildCount(); c++) {
                             View ch = createdRow.getChildAt(c);
                             if (ch instanceof Button && ch.getHeight() > maxH) {
@@ -1008,6 +1192,7 @@ final class DetailScreen {
                                     site,
                                     video,
                                     line,
+                                    bookmarkedEpisode,
                                     stop,
                                     end,
                                     columns,

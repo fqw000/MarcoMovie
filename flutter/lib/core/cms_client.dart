@@ -4,9 +4,11 @@ import 'dart:io';
 import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
+import 'package:path_provider/path_provider.dart';
 import 'cms_parser.dart';
 import 'csp_bridge.dart';
 import 'csp_rule_engines.dart';
@@ -31,6 +33,8 @@ import 'models.dart';
 import 'quark_drive.dart';
 import 'quark_account.dart';
 import 'resilient_http_client.dart';
+import 'spider_gateway.dart';
+import 'spider_plugin_registry.dart';
 import 'storage_service.dart';
 import 'web_media_resolver.dart';
 
@@ -95,14 +99,135 @@ class CmsClient {
   late final DrpySource _drpy = DrpySource(host: _scriptHost,
       read: (url, headers) => _getText(url, headers: headers));
   late final GuardSource _guard = GuardSource(host: _scriptHost, drpy: _drpy,
-      read: (url, headers) => _getBytes(url, headers: headers, byteLimit: GuardSource.maxArtifactBytes));
+      read: _getPluginArtifactBytes);
   late final WoggSource _wogg = WoggSource(
       read: (url, headers) => _getText(url, headers: headers),
-      readBytes: (url, headers) => _getBytes(url, headers: headers,
-          byteLimit: GuardSource.maxArtifactBytes),
+      readBytes: _getPluginArtifactBytes,
       listShare: _listCloudShare,
       listShareWithCancellation: (url, cancel) =>
           runSourceOperation(() => _listCloudShare(url), cancellation: cancel));
+
+  Future<Uint8List> _getPluginArtifactBytes(
+    String url,
+    Map<String, String> headers,
+  ) async {
+    if (_http != null ||
+        kIsWeb ||
+        Platform.environment.containsKey('FLUTTER_TEST')) {
+      return _getBytes(
+        url,
+        headers: headers,
+        byteLimit: GuardSource.maxArtifactBytes,
+      );
+    }
+    File? cacheFile;
+    File? metaFile;
+    try {
+      final support = await getApplicationSupportDirectory();
+      final dir = Directory('${support.path}/plugin_jar_cache');
+      await dir.create(recursive: true);
+      final sortedHeaders = headers.entries.toList()
+        ..sort((a, b) => a.key.compareTo(b.key));
+      final cacheKey = sha256
+          .convert(
+            utf8.encode(
+              jsonEncode([
+                url,
+                [for (final e in sortedHeaders) [e.key, e.value]],
+              ]),
+            ),
+          )
+          .toString();
+      cacheFile = File('${dir.path}/$cacheKey.jar');
+      metaFile = File('${dir.path}/$cacheKey.json');
+      if (await cacheFile.exists() && await metaFile.exists()) {
+        final len = await cacheFile.length();
+        if (len > 0 && len <= GuardSource.maxArtifactBytes) {
+          final meta = jsonDecode(await metaFile.readAsString());
+          if (meta is Map &&
+              meta['sha256'] is String &&
+              meta['ts'] is int &&
+              DateTime.now().millisecondsSinceEpoch - (meta['ts'] as int) <=
+                  24 * 3600 * 1000) {
+            final diskBytes = await cacheFile.readAsBytes();
+            if (sha256.convert(diskBytes).toString() == meta['sha256']) {
+              return diskBytes;
+            }
+          }
+        }
+      }
+    } catch (_) {
+      cacheFile = null;
+      metaFile = null;
+    }
+    try {
+      final downloaded = await _getBytes(
+        url,
+        headers: headers,
+        byteLimit: GuardSource.maxArtifactBytes,
+      );
+      final targetCacheFile = cacheFile;
+      final targetMetaFile = metaFile;
+      if (targetCacheFile != null &&
+          targetMetaFile != null &&
+          downloaded.isNotEmpty) {
+        unawaited(() async {
+          try {
+            final tmp = File(
+              '${targetCacheFile.path}.tmp-${DateTime.now().microsecondsSinceEpoch}',
+            );
+            await tmp.writeAsBytes(downloaded, flush: true);
+            await tmp.rename(targetCacheFile.path);
+            await targetMetaFile.writeAsString(
+              jsonEncode({
+                'sha256': sha256.convert(downloaded).toString(),
+                'ts': DateTime.now().millisecondsSinceEpoch,
+              }),
+              flush: true,
+            );
+            final entries = await targetCacheFile.parent
+                .list()
+                .where((e) => e is File && e.path.endsWith('.jar'))
+                .cast<File>()
+                .toList();
+            if (entries.length > 8) {
+              final stats = <(File, DateTime)>[];
+              for (final f in entries) {
+                stats.add((f, (await f.stat()).modified));
+              }
+              stats.sort((a, b) => a.$2.compareTo(b.$2));
+              for (final (old, _) in stats.take(stats.length - 8)) {
+                try {
+                  await old.delete();
+                  final m = File(
+                    '${old.path.substring(0, old.path.length - 4)}.json',
+                  );
+                  if (await m.exists()) await m.delete();
+                } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        }());
+      }
+      return downloaded;
+    } catch (error) {
+      if (cacheFile != null && metaFile != null) {
+        try {
+          if (await cacheFile.exists() && await metaFile.exists()) {
+            final meta = jsonDecode(await metaFile.readAsString());
+            final diskBytes = await cacheFile.readAsBytes();
+            if (meta is Map &&
+                diskBytes.isNotEmpty &&
+                diskBytes.length <= GuardSource.maxArtifactBytes &&
+                sha256.convert(diskBytes).toString() == meta['sha256']) {
+              return diskBytes;
+            }
+          }
+        } catch (_) {}
+      }
+      rethrow;
+    }
+  }
 
   bool Function() get _sourceCancelled {
     final abort = Zone.current[_cancelKey] as Completer<void>?;
@@ -1018,6 +1143,44 @@ class CmsClient {
     }
   }
 
+  /// Strict Local-First adapter pack resolution: native local adapters always
+  /// take priority; only unadapted `csp_*` sites matched by an enabled user
+  /// adapter pack are materialized into local JS/DRPY/Python/T4 sites.
+  CmsSite _resolveAdapterSite(CmsSite site) {
+    if (!site.usesAdapterPack) return site;
+    final rule = SpiderPluginRegistry.instance.matchAdapterRule(site);
+    return rule == null ? site : rule.materializeSite(site);
+  }
+
+  bool _usesSpiderGateway(CmsSite site) => site.usesSpiderGateway;
+
+  Future<String> _callSpiderGateway(
+    CmsSite site,
+    String action, [
+    Map<String, dynamic> params = const <String, dynamic>{},
+  ]) {
+    return SpiderGatewayClient.invoke(
+      SpiderPluginRegistry.instance.gatewayConfig,
+      site: site,
+      action: action,
+      params: params,
+      client: _http,
+    );
+  }
+
+  /// Downloads and validates a remote `marco-adapter-pack-v1` JSON plugin pack.
+  Future<SpiderAdapterPack> fetchSpiderAdapterPack(String rawUrl) async {
+    final normalized = CmsParser.extractAndNormalizeUrl(rawUrl);
+    if (normalized.isEmpty) {
+      throw const FormatException('请输入有效的 HTTP(S) 插件包地址');
+    }
+    final text = await _getText(normalized);
+    return SpiderAdapterPack.parseJsonString(
+      text,
+      fallbackSourceUrl: normalized,
+    );
+  }
+
   Future<Map<String, dynamic>> sourceVerificationAction(
     CmsSite site, Map<String, Object?> action, {Completer<void>? cancellation}
   ) async {
@@ -1259,7 +1422,23 @@ class CmsClient {
   String _detailAction(CmsSite site) => site.type == 0 ? 'videolist' : 'detail';
 
   Future<(List<CmsCategory>, CmsListing)> fetchHome(CmsSite site) async {
+    site = _resolveAdapterSite(site);
     _requireSourceAdapter(site);
+    if (_usesSpiderGateway(site)) {
+      final raw = await _callSpiderGateway(site, 'home', {'filter': true});
+      final categories = CmsParser.parseCategories(raw);
+      var listing = CmsParser.parseListing(_wrapJsEpisodeIds(raw, scheme: 'mmgw'));
+      if (listing.videos.isEmpty) {
+        try {
+          final vodRaw = await _callSpiderGateway(site, 'homeVod');
+          listing = CmsParser.parseListing(_wrapJsEpisodeIds(vodRaw, scheme: 'mmgw'));
+        } catch (_) {}
+        if (listing.videos.isEmpty && categories.isNotEmpty) {
+          listing = await fetchCategory(site, categories.first.id, 1);
+        }
+      }
+      return (categories, listing);
+    }
     if (_isHttpT4(site)) {
       final raw = await _callT4(site, {'filter': 'true'});
       final categories = CmsParser.parseCategories(raw);
@@ -1341,7 +1520,27 @@ class CmsClient {
     List<String> childIds = const [],
     CmsFilter? filter,
   }) async {
+    site = _resolveAdapterSite(site);
     _requireSourceAdapter(site);
+    if (_usesSpiderGateway(site)) {
+      final filters = <String, String>{
+        if (filter != null && filter.genreLabel.isNotEmpty && filter.genreLabel != '全部') 'class': filter.genreLabel,
+        if (filter != null && filter.area.isNotEmpty && filter.area != '全部') 'area': filter.area,
+        if (filter != null && filter.year.isNotEmpty && filter.year != '全部') 'year': filter.year,
+      };
+      final raw = await _callSpiderGateway(site, 'category', {
+        'tid': categoryId,
+        'pg': page,
+        'filter': filters,
+      });
+      final listing = CmsParser.parseListing(_wrapJsEpisodeIds(raw, scheme: 'mmgw'));
+      return CmsListing(
+        page: listing.page,
+        pageCount: listing.pageCount,
+        videos: listing.videos,
+        sourceFiltered: filters.isNotEmpty,
+      );
+    }
     if (_isHttpT4(site)) {
       final filters = <String, String>{
         if (filter != null && filter.genreLabel.isNotEmpty && filter.genreLabel != '全部') 'class': filter.genreLabel,
@@ -1457,7 +1656,15 @@ class CmsClient {
     String keyword, {
     int page = 1,
   }) async {
+    site = _resolveAdapterSite(site);
     _requireSourceAdapter(site);
+    if (_usesSpiderGateway(site)) {
+      final raw = await _callSpiderGateway(site, 'search', {
+        'wd': keyword.trim(),
+        'pg': page,
+      });
+      return CmsParser.parseListing(_wrapJsEpisodeIds(raw, scheme: 'mmgw'));
+    }
     if (_isHttpT4(site)) {
       final raw = await _callT4(site, {'wd': keyword.trim(), 'quick': 'false', 'pg': '$page'});
       return CmsParser.parseListing(_wrapJsEpisodeIds(raw, scheme: 'mmt4'));
@@ -1625,7 +1832,7 @@ class CmsClient {
     final filtered = candidates.where((s) => s.key != source.key &&
         s.isEffectivelyPrivate == source.isEffectivelyPrivate && s.searchable &&
         s.canBrowse && !CspBridge.isDoubanSite(s) && !CspBridge.isMyDriveSite(s) &&
-        (_usesJs(s) || CspBridge.usesWoggNetdiskAdapter(s) || !CspBridge.canHandleSite(s) || CspBridge.backendsForSite(s).isNotEmpty ||
+        (_usesJs(s) || s.usesAdapterPack || s.usesSpiderGateway || CspBridge.usesWoggNetdiskAdapter(s) || !CspBridge.canHandleSite(s) || CspBridge.backendsForSite(s).isNotEmpty ||
           CspRuleEngines.supports(s) || CspBridge.isBiliSite(s) ||
           CspBridge.isFirstAidSite(s) || CspBridge.isTuxiaobeiSite(s))).toList();
     int sitePriority(CmsSite s) {
@@ -1769,6 +1976,9 @@ class CmsClient {
   String _detailCacheKey(CmsSite site, CmsVideo fallback) => jsonEncode([
         JsSourceHost.generation,
         _pythonHost.generation,
+        SpiderPluginRegistry.instance.enabledRuleCount,
+        SpiderPluginRegistry.instance.gatewayConfig.isActive,
+        SpiderPluginRegistry.instance.gatewayConfig.normalizedBaseUrl,
         site.subscriptionId,
         site.sourceKey,
         site.isEffectivelyPrivate,
@@ -2063,11 +2273,17 @@ class CmsClient {
   }
 
   Future<CmsVideo> _fetchDetailUncached(CmsSite site, CmsVideo fallback) async {
+    site = _resolveAdapterSite(site);
     if (fallback.id.startsWith('mmquark://owned?')) {
       return _mergeDetail(CmsVideo(id: fallback.id, title: fallback.title,
           lines: [CmsLine(name: '夸克网盘', episodes: [
             CmsEpisode(name: fallback.title, url: fallback.id),
           ])]), fallback);
+    }
+    if (_usesSpiderGateway(site)) {
+      final raw = await _callSpiderGateway(site, 'detail', {'id': fallback.id});
+      final listing = CmsParser.parseListing(_wrapJsEpisodeIds(raw, scheme: 'mmgw'));
+      return listing.videos.isEmpty ? fallback : _mergeDetail(listing.videos.first, fallback);
     }
     if (_isHttpT4(site)) {
       final raw = await _callT4(site, {'ac': 'detail', 'ids': fallback.id});
@@ -2114,21 +2330,58 @@ class CmsClient {
     if (listing.videos.isEmpty) return fallback;
     return _mergeDetail(listing.videos.first, fallback);
   }
-  CmsVideo _mergeDetail(CmsVideo detailed, CmsVideo fallback) => CmsVideo(
-    id: detailed.id.isEmpty ? fallback.id : detailed.id,
-    title: detailed.title.isEmpty ? fallback.title : detailed.title,
-    poster: CmsParser.isBrokenPosterUrl(detailed.poster) ? fallback.poster : detailed.poster,
-    remarks: detailed.remarks.isEmpty ? fallback.remarks : detailed.remarks,
-    year: detailed.year.isEmpty ? fallback.year : detailed.year,
-    area: detailed.area.isEmpty ? fallback.area : detailed.area,
-    actor: detailed.actor.isEmpty ? fallback.actor : detailed.actor,
-    description: detailed.description.isEmpty ? fallback.description : detailed.description,
-    tag: detailed.tag.isEmpty ? fallback.tag : detailed.tag,
-    doubanScore: detailed.doubanScore ?? fallback.doubanScore,
-    rtScore: detailed.rtScore ?? fallback.rtScore,
-    lines: detailed.lines,
-    sourceWarnings: detailed.sourceWarnings,
+  static final RegExp _pollutedTitleSuffixRe = RegExp(
+    r'^[\s·\-—:：]*(?:更新至|更至|更新到|连载至|全\s*\d+\s*[集期话]|共\s*\d+\s*[集期话]|已完结|完结).*$',
   );
+
+  CmsVideo _mergeDetail(CmsVideo detailed, CmsVideo fallback) {
+    final rawDetailTitle = detailed.title.trim();
+    final cleanFallbackTitle = fallback.title.trim();
+    var mergedTitle = rawDetailTitle.isEmpty ? fallback.title : detailed.title;
+    var extractedRemarks = '';
+    if (cleanFallbackTitle.isNotEmpty &&
+        rawDetailTitle.length > cleanFallbackTitle.length &&
+        rawDetailTitle.startsWith(cleanFallbackTitle)) {
+      final tail = rawDetailTitle.substring(cleanFallbackTitle.length).trim();
+      if (_pollutedTitleSuffixRe.hasMatch(tail)) {
+        mergedTitle = cleanFallbackTitle;
+        extractedRemarks = tail.replaceFirst(RegExp(r'^[\s·\-—:：]+'), '').trim();
+      }
+    } else if (rawDetailTitle.isNotEmpty) {
+      final suffixMatch = RegExp(
+        r'^(.+?)(?:[\s·\-—:：]*(?:更新至|更至|更新到|连载至)(?:第?\s*\d+\s*[集期话篇章]|[^\s]{1,12}))\s*$',
+      ).firstMatch(rawDetailTitle);
+      if (suffixMatch != null && suffixMatch.group(1)!.trim().isNotEmpty) {
+        mergedTitle = suffixMatch.group(1)!.trim();
+        extractedRemarks = rawDetailTitle
+            .substring(suffixMatch.group(1)!.length)
+            .replaceFirst(RegExp(r'^[\s·\-—:：]+'), '')
+            .trim();
+      }
+    }
+    final mergedRemarks = detailed.remarks.isNotEmpty
+        ? detailed.remarks
+        : (fallback.remarks.isNotEmpty ? fallback.remarks : extractedRemarks);
+    return CmsVideo(
+      id: detailed.id.isEmpty ? fallback.id : detailed.id,
+      title: mergedTitle,
+      poster: CmsParser.isBrokenPosterUrl(detailed.poster)
+          ? fallback.poster
+          : detailed.poster,
+      remarks: mergedRemarks,
+      year: detailed.year.isEmpty ? fallback.year : detailed.year,
+      area: detailed.area.isEmpty ? fallback.area : detailed.area,
+      actor: detailed.actor.isEmpty ? fallback.actor : detailed.actor,
+      description: detailed.description.isEmpty
+          ? fallback.description
+          : detailed.description,
+      tag: detailed.tag.isEmpty ? fallback.tag : detailed.tag,
+      doubanScore: detailed.doubanScore ?? fallback.doubanScore,
+      rtScore: detailed.rtScore ?? fallback.rtScore,
+      lines: detailed.lines,
+      sourceWarnings: detailed.sourceWarnings,
+    );
+  }
   Uri? _sourceCredentialOrigin(CmsSite site) {
     if (site.isHttpApi) return Uri.tryParse(site.api);
     Object? extension = site.ext;
@@ -2529,6 +2782,7 @@ class CmsClient {
     CmsEpisode episode, {
     List<CmsParse> parses = const [],
   }) async {
+    site = _resolveAdapterSite(site);
     if (episode.url.startsWith('mmshare://') ||
         episode.url.toLowerCase().startsWith('push://') ||
         ResilientHttpClient.cloudProviderForShare(episode.url) != null) {
@@ -2563,6 +2817,38 @@ class CmsClient {
           accounts: (await StorageService.init()).quarkAccounts, httpClient: _http, isCancelled: _sourceCancelled);
       try { return await drive.resolveWoggShare(episode); }
       finally { if (_quark == null) drive.close(); }
+    }
+    if (episode.isGatewayEpisode) {
+      if (!_usesSpiderGateway(site) &&
+          !SpiderPluginRegistry.instance.gatewayConfig.isActive) {
+        throw const FormatException('蜘蛛网关未启用，无法解析该线路播放地址');
+      }
+      final parameters = Uri.parse(episode.url).queryParameters;
+      final raw = jsonDecode(
+        await _callSpiderGateway(site, 'play', {
+          'flag': parameters['flag'] ?? '',
+          'id': parameters['id'] ?? '',
+        }),
+      );
+      if (raw is! Map) throw const FormatException('蜘蛛网关没有返回有效的播放地址');
+      final payloadUrl = raw['url'];
+      if (payloadUrl is String) {
+        final shareResolved = await _tryResolveCloudShareTarget(
+          site,
+          episode,
+          payloadUrl,
+          parses: parses,
+        );
+        if (shareResolved != null) return shareResolved;
+      }
+      final payload = await _maybeUnwrapSpiderPayload(site, raw, parses: parses);
+      return SourcePlayback.decode(
+        payload,
+        episode,
+        localUrl: _scriptHost.resolve,
+        sourceHeaders: site.headers,
+        sourceOrigin: _sourceCredentialOrigin(site),
+      );
     }
     if (WoggSource.supports(site)) {
       throw const FormatException('请刷新详情以读取原始网盘线路，旧缓存不能用于此源');
@@ -2819,14 +3105,14 @@ class CmsClient {
       }
       if (CspBridge.canHandleSite(s)) {
         final backends = CspBridge.backendsForSite(s);
-        final nativeAdapter = _usesJs(s) || CspRuleEngines.supports(s) || CspBridge.isBiliSite(s) || CspBridge.isFirstAidSite(s) || CspBridge.isTuxiaobeiSite(s);
+        final nativeAdapter = _usesJs(s) || s.usesAdapterPack || s.usesSpiderGateway || CspRuleEngines.supports(s) || CspBridge.isBiliSite(s) || CspBridge.isFirstAidSite(s) || CspBridge.isTuxiaobeiSite(s);
         if (!nativeAdapter && backends.isEmpty) continue;
         final String sig;
-        if (_usesJs(s)) {
+        if (_usesJs(s) || s.usesAdapterPack || s.usesSpiderGateway) {
           // The same plugin key in two subscriptions can have different
           // artifacts, extensions and credentials. They are separate sources.
           sig = jsonEncode([s.subscriptionId, s.key, s.api, s.ext,
-            s.pluginReference, s.headers]);
+            s.pluginReference, s.headers, s.usesAdapterPack, s.usesSpiderGateway]);
         } else if (CspRuleEngines.supports(s)) {
           sig = jsonEncode(['csp_rule', s.subscriptionId, s.key, s.api, s.ext]);
         } else if (CspBridge.isBiliSite(s)) {
@@ -2861,8 +3147,11 @@ class CmsClient {
         inFlight++;
         final abort = Completer<void>();
         requests.add(abort);
+        final perSiteTimeout = Duration(
+          seconds: (_usesJs(site) || site.isCatPaw) ? 20 : 12,
+        );
         runZoned(() => fetchSearch(site, keyword), zoneValues: {_cancelKey: abort})
-            .timeout(const Duration(seconds: 12))
+            .timeout(perSiteTimeout)
             .then((listing) {
           if (!cancelled && !controller.isClosed && listing.videos.isNotEmpty) {
             controller.add((site, listing.videos));

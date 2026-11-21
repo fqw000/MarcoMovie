@@ -22,6 +22,8 @@ __pycache__/
 local.properties
 *.log
 .DS_Store
+**/.DS_Store
+._*
 .git
 .github
 .git-blame-ignore-revs

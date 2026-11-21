@@ -22,6 +22,7 @@ import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.TextView;
 import com.pilipala.glass.GlassworkSurface;
+import com.pilipala.marcomovie.hud.PlayerHudPrefs;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
@@ -207,6 +208,12 @@ final class MobileIosSettings {
             }
         }
         MobileShell.settingsSubPage = activePane != null ? 1 : 0;
+
+        if (!a.isTvDevice() && activePane != null && "关于与更新".equals(activePane.title)) {
+            AuroraSurfaceView aurora = new AuroraSurfaceView(a);
+            aurora.setReducedMotion(a.reduced);
+            contentContainer.addView(aurora, 0, new FrameLayout.LayoutParams(-1, -1));
+        }
 
         if (activePane == null) {
             // ==================== LEVEL 1: PRIMARY SETTINGS PAGE ====================
@@ -887,6 +894,36 @@ final class MobileIosSettings {
                                         ctl.rerenderInPlace();
                                     });
 
+                            DanmuSettingsPanel.DanmuConfig dmCfg =
+                                    DanmuSettingsPanel.loadConfig(a, false);
+                            int dmOrigins = dmCfg.createProvider().getConfiguredOrigins().size();
+                            String dmSummary =
+                                    (dmCfg.enabled ? "已开启" : "已关闭")
+                                            + " · "
+                                            + (dmOrigins > 0
+                                                    ? "已配置 " + dmOrigins + " 个自定义服务源"
+                                                    : "未配置自定义服务源");
+                            addActionCapsule(
+                                    a,
+                                    body,
+                                    ICON_LAYERS,
+                                    COLOR_TEAL,
+                                    "弹幕外观与自定义服务设置",
+                                    dmSummary,
+                                    () -> {
+                                        android.app.AlertDialog dlg =
+                                                DanmuSettingsPanel.showDialog(a, false, null);
+                                        dlg.setOnDismissListener(
+                                                d -> {
+                                                    if (!a.isFinishing()
+                                                            && (android.os.Build.VERSION.SDK_INT
+                                                                            < 17
+                                                                    || !a.isDestroyed())) {
+                                                        ctl.rerenderInPlace();
+                                                    }
+                                                });
+                                    });
+
                             boolean alwaysClock =
                                     a.prefs.getBoolean(Prefs.PLAYER_ALWAYS_SHOW_CLOCK, false);
                             addChoices(
@@ -936,6 +973,103 @@ final class MobileIosSettings {
                                                     a, null, ctl::rerenderInPlace));
                         });
 
+        PaneSpec hudGestureSub =
+                new PaneSpec(
+                        "触控手势与 HUD",
+                        "自定义双击区域行为、长按倍速恢复策略、起播规格提示与底部细进度条",
+                        ICON_PLAY_CIRCLE,
+                        COLOR_TEAL,
+                        (body, ctl) -> {
+                            final String[] sideVals = {
+                                PlayerHudPrefs.SIDES_SEEK_5S,
+                                PlayerHudPrefs.SIDES_SEEK_10S,
+                                PlayerHudPrefs.SIDES_SEEK_15S,
+                                PlayerHudPrefs.SIDES_PLAY_PAUSE
+                            };
+                            String curSides = PlayerHudPrefs.getDoubleTapSides(a);
+                            int sideIdx = 1;
+                            for (int i = 0; i < sideVals.length; i++) {
+                                if (sideVals[i].equals(curSides)) {
+                                    sideIdx = i;
+                                    break;
+                                }
+                            }
+                            addChoices(
+                                    a,
+                                    body,
+                                    "双击屏幕左右两侧",
+                                    new String[] {"±5 秒", "±10 秒", "±15 秒", "播放 / 暂停"},
+                                    sideIdx,
+                                    idx -> {
+                                        PlayerHudPrefs.setDoubleTapSides(a, sideVals[idx]);
+                                        ctl.rerenderInPlace();
+                                    });
+
+                            final String[] centerVals = {
+                                PlayerHudPrefs.CENTER_PLAY_PAUSE,
+                                PlayerHudPrefs.CENTER_FULLSCREEN,
+                                PlayerHudPrefs.CENTER_NONE
+                            };
+                            String curCenter = PlayerHudPrefs.getDoubleTapCenter(a);
+                            int centerIdx = 0;
+                            for (int i = 0; i < centerVals.length; i++) {
+                                if (centerVals[i].equals(curCenter)) {
+                                    centerIdx = i;
+                                    break;
+                                }
+                            }
+                            addChoices(
+                                    a,
+                                    body,
+                                    "双击屏幕中央",
+                                    new String[] {"播放 / 暂停", "切换横竖屏全屏", "关闭"},
+                                    centerIdx,
+                                    idx -> {
+                                        PlayerHudPrefs.setDoubleTapCenter(a, centerVals[idx]);
+                                        ctl.rerenderInPlace();
+                                    });
+
+                            String curRestore = PlayerHudPrefs.getLongPressRestoreMode(a);
+                            addChoices(
+                                    a,
+                                    body,
+                                    "长按倍速松手恢复",
+                                    new String[] {"恢复长按前倍速", "固定恢复 1.0×"},
+                                    PlayerHudPrefs.RESTORE_ONE_X.equals(curRestore) ? 1 : 0,
+                                    idx -> {
+                                        PlayerHudPrefs.setLongPressRestoreMode(
+                                                a,
+                                                idx == 1
+                                                        ? PlayerHudPrefs.RESTORE_ONE_X
+                                                        : PlayerHudPrefs.RESTORE_PREVIOUS);
+                                        ctl.rerenderInPlace();
+                                    });
+
+                            boolean startSpec = PlayerHudPrefs.isStartSpecHudEnabled(a);
+                            addChoices(
+                                    a,
+                                    body,
+                                    "起播画质规格提示",
+                                    new String[] {"开启", "关闭"},
+                                    startSpec ? 0 : 1,
+                                    idx -> {
+                                        PlayerHudPrefs.setStartSpecHudEnabled(a, idx == 0);
+                                        ctl.rerenderInPlace();
+                                    });
+
+                            boolean slimBar = PlayerHudPrefs.isSlimProgressEnabled(a);
+                            addChoices(
+                                    a,
+                                    body,
+                                    "隐藏工具栏底部细进度条",
+                                    new String[] {"开启", "关闭"},
+                                    slimBar ? 0 : 1,
+                                    idx -> {
+                                        PlayerHudPrefs.setSlimProgressEnabled(a, idx == 0);
+                                        ctl.rerenderInPlace();
+                                    });
+                        });
+
         PaneSpec introOutroSub =
                 new PaneSpec(
                         "片头与片尾",
@@ -943,6 +1077,18 @@ final class MobileIosSettings {
                         ICON_SKIP,
                         COLOR_CORAL,
                         (body, ctl) -> {
+                            boolean countdown = PlayerHudPrefs.isSkipCountdownEnabled(a);
+                            addChoices(
+                                    a,
+                                    body,
+                                    "跳过片头片尾提示方式",
+                                    new String[] {"3 秒可取消倒计时", "静默立即跳过"},
+                                    countdown ? 0 : 1,
+                                    idx -> {
+                                        PlayerHudPrefs.setSkipCountdownEnabled(a, idx == 0);
+                                        ctl.rerenderInPlace();
+                                    });
+
                             int skipCount = PlaybackControls.countVideoSkipRecords(a);
                             addActionCapsule(
                                     a,
@@ -959,9 +1105,10 @@ final class MobileIosSettings {
                         });
 
         PaneSpec playbackPane =
-                new PaneSpec("播放", "画质、倍速、选集与自动跳过", ICON_PLAY_CIRCLE, COLOR_ORANGE, null)
+                new PaneSpec("播放", "画质、倍速、手势与自动跳过", ICON_PLAY_CIRCLE, COLOR_ORANGE, null)
                         .addChild(videoQualitySub)
                         .addChild(speedEpisodeSub)
+                        .addChild(hudGestureSub)
                         .addChild(introOutroSub);
         top.add(playbackPane);
 
@@ -1450,6 +1597,18 @@ final class MobileIosSettings {
                                                     new MainActivity.Screen(
                                                             () -> new UpdateScreen(a).show()),
                                                     true));
+
+                            addActionCapsule(
+                                    a,
+                                    body,
+                                    ICON_SPARKLES,
+                                    COLOR_INDIGO,
+                                    "重新查看新手引导",
+                                    "重温 5 幕功能导览并重新启用首播手势提示",
+                                    () -> {
+                                        OnboardingScreen.resetForReplay(a);
+                                        a.showOnboarding(true);
+                                    });
 
                             TextView legal =
                                     a.text(

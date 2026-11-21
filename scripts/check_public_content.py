@@ -110,6 +110,7 @@ EXPERIMENT_HOSTS = {
     'scripts/ios_lxml/owner_fixture.py': {'www.w3.org'},
     'scripts/ios_cpython/README.md': {'docs.python.org', 'briefcase.beeware.org'},
     'scripts/ios_cpython_transport/README.md': {'requests.readthedocs.io', 'www.rfc-editor.org'},
+    '.github/workflows/build-multiplatform.yml': {'gitcode.com'},
 }
 
 # Original cloud-provider endpoints used only for an explicitly selected share
@@ -122,6 +123,7 @@ CLOUD_SHARE_HOSTS = {
     'flutter/lib/core/netdisk_service.dart': {'auth.aliyundrive.com'},
     'flutter/lib/core/cloud_share.dart': {'fast.uc.cn'},
     'flutter/lib/core/doh_resolver.dart': {'dns.alidns.com', 'cloudflare-dns.com', 'dns.google'},
+    'shared/catpaw/drpy-http.cjs': {'223.5.5.5', '1.12.12.12', 'dns.alidns.com', 'cloudflare-dns.com'},
 }
 
 def paths():
@@ -147,7 +149,11 @@ for p in files:
     if relative.as_posix() in CONFORMANCE_INPUT_SHA256:
         if hashlib.sha256(p.read_bytes()).hexdigest()!=CONFORMANCE_INPUT_SHA256[relative.as_posix()]:issues.append(f'{relative}: unreviewed conformance fixture')
         continue
-    vendor_dart = relative.as_posix().startswith(('flutter/lib/', 'flutter/packages/quickjs_engine/lib/')) and p.suffix == '.dart'
+    vendor_dart = relative.as_posix().startswith((
+        'flutter/lib/',
+        'flutter/packages/quickjs_engine/lib/',
+        'flutter/packages/ohos_platform_shims/lib/',
+    )) and p.suffix == '.dart'
     allow_lib = vendor_dart or relative.as_posix().startswith('android/tests/lib/aosp-json/')
     if any(part in (EXCLUDED - {'lib'} if allow_lib else EXCLUDED) for part in relative.parts) or p.suffix in {'.apk','.aab','.p12','.jks','.keystore','.rar','.zip','.bin','.mp4'}:
         issues.append(f'{relative}: excluded file type/path');continue

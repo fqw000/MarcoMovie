@@ -61,10 +61,17 @@ final class SourceController {
     }
 
     static SourceEngine engine(MainActivity a, Cms.Site s) throws Exception {
+        return engine(a, s, null);
+    }
+
+    static SourceEngine engine(MainActivity a, Cms.Site s, TvSearchContext context)
+            throws Exception {
         if (Thread.currentThread().isInterrupted()) throw new InterruptedException();
         final Cms.Config snapshot;
         final int epoch;
         synchronized (a) {
+            if (context != null && !context.matches(a.config, a.privateMode, a.engineEpoch))
+                throw new IOException("搜索上下文已失效");
             SourceEngine existing = a.engines.get(s.key);
             if (existing instanceof QueuedSourceEngine
                     && ((QueuedSourceEngine) existing).isWedged()) {
@@ -80,6 +87,9 @@ final class SourceController {
                 () -> {
                     synchronized (a) {
                         if (epoch != a.engineEpoch) throw new IOException("配置已更改，请重新选择来源");
+                        if (context != null
+                                && !context.matches(a.config, a.privateMode, a.engineEpoch))
+                            throw new IOException("搜索上下文已失效");
                         SourceEngine existing = a.engines.get(s.key);
                         if (existing != null) return existing;
                     }
@@ -122,7 +132,10 @@ final class SourceController {
                     } else throw new IOException("来源需要尚未启用的扩展引擎");
                     SourceEngine created = new QueuedSourceEngine(raw);
                     synchronized (a) {
-                        if (epoch == a.engineEpoch) {
+                        if (epoch == a.engineEpoch
+                                && (context == null
+                                        || context.matches(
+                                                a.config, a.privateMode, a.engineEpoch))) {
                             if (raw instanceof JsEngine) ((JsEngine) raw).activate();
                             a.engines.put(s.key, created);
                             return created;
@@ -140,6 +153,8 @@ final class SourceController {
     }
 
     static void closeEngines(MainActivity a) {
+        if (a.markerHost != null) a.markerHost.abort();
+        GlobalSearchScreen.invalidateContext(a);
         a.liveSession = null;
         CspEngine.resetActiveProxy();
         if (a.detailPrefetch != null) a.detailPrefetch.cancel(true);
@@ -307,6 +322,8 @@ final class SourceController {
     static void loadDetail(
             MainActivity a, Cms.Site site, String id, MainActivity.Done<Cms.Video> done) {
         final int ticket = a.generation, epoch = a.engineEpoch;
+        final TvSearchContext detailContext =
+                new TvSearchContext(a.config, a.privateMode, a.engineEpoch);
         final String key = epoch + ":" + site.key.length() + ":" + site.key + id;
         final DetailRequest timing = new DetailRequest();
         Future<?> request =
@@ -325,7 +342,8 @@ final class SourceController {
                                                     () -> {
                                                         String cached = a.detailCache.get(key);
                                                         if (cached != null) return cached;
-                                                        SourceEngine source = a.engine(site);
+                                                        SourceEngine source =
+                                                                engine(a, site, detailContext);
                                                         timing.engineReady =
                                                                 SystemClock.elapsedRealtime();
                                                         String fetched =
@@ -346,7 +364,9 @@ final class SourceController {
                                 Cms.Listing listing = Cms.listing(raw);
                                 if (listing.videos.isEmpty()) throw new IOException("来源没有返回影片详情");
                                 timing.parsed = SystemClock.elapsedRealtime();
-                                if (!timing.cached && epoch == a.engineEpoch)
+                                if (!timing.cached
+                                        && detailContext.matches(
+                                                a.config, a.privateMode, a.engineEpoch))
                                     a.detailCache.put(key, raw);
                                 Cms.Video video = listing.videos.get(0);
                                 if ((video.id == null || video.id.trim().isEmpty()) && id != null) {
@@ -354,7 +374,11 @@ final class SourceController {
                                 }
                                 a.ui.post(
                                         () -> {
-                                            if (a.isFinishing() || ticket != a.generation) return;
+                                            if (a.isFinishing()
+                                                    || ticket != a.generation
+                                                    || !detailContext.matches(
+                                                            a.config, a.privateMode, a.engineEpoch))
+                                                return;
                                             try {
                                                 done.accept(video);
                                                 a.root.postOnAnimation(timing::ready);
@@ -366,7 +390,11 @@ final class SourceController {
                                 if (Thread.currentThread().isInterrupted()) return;
                                 a.ui.post(
                                         () -> {
-                                            if (a.isFinishing() || ticket != a.generation) return;
+                                            if (a.isFinishing()
+                                                    || ticket != a.generation
+                                                    || !detailContext.matches(
+                                                            a.config, a.privateMode, a.engineEpoch))
+                                                return;
                                             View state = a.root.findViewWithTag("detail-loading");
                                             if (state instanceof TextView)
                                                 ((TextView) state).setText(a.message(error));
@@ -446,7 +474,7 @@ final class SourceController {
     }
 
     static void learnTitles(MainActivity a, List<Cms.Video> videos) {
-        if (a.privateMode) return;
+        if (a.privateMode || a.switchingPrivacy) return;
         if (a.phonetic == null || videos == null || videos.isEmpty()) return;
         for (Cms.Video video : videos)
             if (video.title != null && !video.title.isEmpty()) a.pendingTitles.add(video.title);
@@ -461,28 +489,46 @@ final class SourceController {
         a.pendingTitles.clear();
         final PhoneticSearchIndex index = a.phonetic;
         final android.content.SharedPreferences target = a.prefs;
-        if (index == null || titles.isEmpty()) return;
+        if (index == null || titles.isEmpty() || a.privateMode || a.switchingPrivacy) return;
+        final TvSearchContext context = new TvSearchContext(a.config, a.privateMode, a.engineEpoch);
         a.phoneticWork.execute(
                 () -> {
-                    LinkedHashSet<String> values = new LinkedHashSet<>();
-                    try {
-                        org.json.JSONArray previous =
-                                new org.json.JSONArray(
-                                        target.getString(Prefs.PHONETIC_TITLES, "[]"));
-                        for (int i = 0; i < previous.length(); i++)
-                            values.add(previous.optString(i));
-                    } catch (Exception ignored) {
-                    }
-                    for (String title : titles) {
-                        index.learn(title);
-                        values.add(title);
-                    }
-                    while (values.size() > 400) values.remove(values.iterator().next());
-                    target.edit()
-                            .putString(
-                                    Prefs.PHONETIC_TITLES,
-                                    new org.json.JSONArray(values).toString())
-                            .apply();
+                    if (!context.matches(a.config, a.privateMode, a.engineEpoch)) return;
+                    final PhoneticSearchIndex.PreparedTitles prepared = index.prepareTitles(titles);
+                    if (!context.matches(a.config, a.privateMode, a.engineEpoch)) return;
+                    // Commit on the UI thread with the space switch, not between worker checks.
+                    // A stale worker may finish parsing, but cannot mutate an index or persist it.
+                    a.ui.post(
+                            () -> {
+                                if (a.isDestroyed()
+                                        || a.isFinishing()
+                                        || a.switchingPrivacy
+                                        || a.phonetic != index
+                                        || !context.matches(a.config, a.privateMode, a.engineEpoch))
+                                    return;
+                                // Merge with the latest committed cache here. Multiple workers can
+                                // finish
+                                // before either UI commit; a worker's earlier snapshot would lose a
+                                // batch.
+                                LinkedHashSet<String> values = new LinkedHashSet<>();
+                                try {
+                                    org.json.JSONArray previous =
+                                            new org.json.JSONArray(
+                                                    target.getString(
+                                                            Prefs.PHONETIC_PUBLIC_TITLES_V2, "[]"));
+                                    for (int i = 0; i < previous.length(); i++)
+                                        values.add(previous.optString(i));
+                                } catch (Exception ignored) {
+                                }
+                                values.addAll(titles);
+                                while (values.size() > 400) values.remove(values.iterator().next());
+                                index.learnPrepared(prepared);
+                                target.edit()
+                                        .putString(
+                                                Prefs.PHONETIC_PUBLIC_TITLES_V2,
+                                                new org.json.JSONArray(values).toString())
+                                        .apply();
+                            });
                 });
     }
 
@@ -826,18 +872,7 @@ final class SourceController {
                                 a.ui.post(
                                         () -> {
                                             if (controls == a.playbackControls) {
-                                                controls.danmaku.enabled(true);
-                                                controls.danmaku.loadText(
-                                                        text,
-                                                        new DanmakuView.Listener() {
-                                                            public void loaded(int count) {
-                                                                a.toast("已加载 " + count + " 条弹幕");
-                                                            }
-
-                                                            public void error(String message) {
-                                                                a.notice(message);
-                                                            }
-                                                        });
+                                                controls.loadLocalDanmakuText(text);
                                             }
                                         });
                             } catch (Exception error) {
@@ -891,46 +926,281 @@ final class SourceController {
         pickDocument(a, 47, "这台设备没有文件选择器，请使用网址或剪贴板导入直播源。");
     }
 
+    static void upsertCustomLiveSource(MainActivity a, String name, String url) {
+        if (a == null || a.prefs == null || url == null || url.trim().isEmpty()) return;
+        java.util.List<LiveQualityPolicy.CustomLiveSource> list =
+                LiveQualityPolicy.parseCustomSources(
+                        a.prefs.getString(Prefs.LIVE_SOURCES_JSON, ""),
+                        a.prefs.getString(Prefs.LIVE_URL, ""),
+                        a.prefs.getString(Prefs.LIVE_NAME, ""));
+        String cleanUrl = url.trim();
+        String cleanName = name == null || name.trim().isEmpty() ? "自定义直播源" : name.trim();
+        java.util.List<LiveQualityPolicy.CustomLiveSource> updated = new java.util.ArrayList<>();
+        updated.add(new LiveQualityPolicy.CustomLiveSource(cleanName, cleanUrl));
+        for (LiveQualityPolicy.CustomLiveSource item : list) {
+            if (!item.url.equals(cleanUrl) && updated.size() < 16) {
+                updated.add(item);
+            }
+        }
+        a.prefs
+                .edit()
+                .putString(Prefs.LIVE_SOURCES_JSON, LiveQualityPolicy.encodeCustomSources(updated))
+                .putString(Prefs.LIVE_URL, updated.get(0).url)
+                .putString(Prefs.LIVE_NAME, updated.get(0).name)
+                .apply();
+    }
+
+    static void showUdpxyDialog(MainActivity a) {
+        LinearLayout panel = a.vertical();
+        panel.setPadding(a.dp(4), a.dp(6), a.dp(4), a.dp(4));
+        TextView tip =
+                a.text(
+                        "填写路由器或 NAS 上的 udpxy / rtp2httpd 单播代理根地址后，列表中 rtp:// 与 udp:// 运营商高清组播源将自动转为 HTTP 单播播放：",
+                        13,
+                        MainActivity.MUTED);
+        panel.addView(tip);
+        a.gap(panel, 10);
+        final android.widget.EditText input = new android.widget.EditText(a);
+        input.setSingleLine(true);
+        input.setHint("例如 http://…:4022（路由器局域网地址:端口）");
+        input.setHintTextColor(0xff6b7280);
+        input.setTextColor(MainActivity.WHITE);
+        input.setTextSize(14);
+        input.setPadding(a.dp(12), a.dp(10), a.dp(12), a.dp(10));
+        input.setBackground(a.bg(0xff1e2623, 12));
+        String current = a.prefs.getString(Prefs.LIVE_UDPXY_URL, "");
+        if (!current.isEmpty()) {
+            input.setText(current);
+            input.setSelection(current.length());
+        }
+        panel.addView(input, new LinearLayout.LayoutParams(-1, -2));
+        AppDialog.Builder builder =
+                new AppDialog.Builder(a)
+                        .setTitle("组播转单播网关 (udpxy)")
+                        .setView(panel)
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton(
+                                "保存",
+                                (d, w) -> {
+                                    String raw = input.getText().toString().trim();
+                                    try {
+                                        String norm = LiveQualityPolicy.normalizeUdpxyBase(raw);
+                                        a.prefs
+                                                .edit()
+                                                .putString(Prefs.LIVE_UDPXY_URL, norm)
+                                                .apply();
+                                        a.toast(
+                                                norm.isEmpty()
+                                                        ? "已关闭 udpxy 组播重写"
+                                                        : "已保存组播网关：" + norm);
+                                        if (!a.isTvDevice()) MobileShell.show(a);
+                                        else a.refresh();
+                                    } catch (Exception ex) {
+                                        a.toast(a.message(ex));
+                                    }
+                                });
+        if (!current.isEmpty()) {
+            builder.setNeutralButton(
+                    "清除网关",
+                    (d, w) -> {
+                        a.prefs.edit().remove(Prefs.LIVE_UDPXY_URL).apply();
+                        a.toast("已清除 udpxy 组播网关");
+                        if (!a.isTvDevice()) MobileShell.show(a);
+                        else a.refresh();
+                    });
+        }
+        builder.show();
+    }
+
+    static void showEpgDialog(MainActivity a) {
+        LinearLayout panel = a.vertical();
+        panel.setPadding(a.dp(4), a.dp(6), a.dp(4), a.dp(4));
+        TextView tip =
+                a.text(
+                        "填写自定义 XMLTV 节目单地址（支持 .xml 与 .xml.gz，留空则自动读取 M3U 头部声明的 x-tvg-url）：",
+                        13,
+                        MainActivity.MUTED);
+        panel.addView(tip);
+        a.gap(panel, 10);
+        final android.widget.EditText input = new android.widget.EditText(a);
+        input.setSingleLine(true);
+        input.setHint("例如 https://…/epg.xml.gz");
+        input.setHintTextColor(0xff6b7280);
+        input.setTextColor(MainActivity.WHITE);
+        input.setTextSize(14);
+        input.setPadding(a.dp(12), a.dp(10), a.dp(12), a.dp(10));
+        input.setBackground(a.bg(0xff1e2623, 12));
+        String current = a.prefs.getString(Prefs.LIVE_EPG_URL, "");
+        if (!current.isEmpty()) {
+            input.setText(current);
+            input.setSelection(current.length());
+        }
+        panel.addView(input, new LinearLayout.LayoutParams(-1, -2));
+        AppDialog.Builder builder =
+                new AppDialog.Builder(a)
+                        .setTitle("自定义 XMLTV 节目单 (EPG)")
+                        .setView(panel)
+                        .setNegativeButton("取消", null)
+                        .setPositiveButton(
+                                "保存",
+                                (d, w) -> {
+                                    String raw = input.getText().toString().trim();
+                                    if (raw.isEmpty()) {
+                                        a.prefs.edit().remove(Prefs.LIVE_EPG_URL).apply();
+                                        a.toast("已恢复使用列表自带 EPG");
+                                    } else if (!Cms.isHttp(raw)) {
+                                        a.toast("请输入有效的 HTTP(S) XMLTV 地址");
+                                        return;
+                                    } else {
+                                        try {
+                                            String norm = Cms.normalizeHttp(raw);
+                                            a.prefs
+                                                    .edit()
+                                                    .putString(Prefs.LIVE_EPG_URL, norm)
+                                                    .apply();
+                                            a.toast("已保存 EPG 节目单地址");
+                                        } catch (Exception ex) {
+                                            a.toast(a.message(ex));
+                                            return;
+                                        }
+                                    }
+                                    if (!a.isTvDevice()) MobileShell.show(a);
+                                    else a.refresh();
+                                });
+        if (!current.isEmpty()) {
+            builder.setNeutralButton(
+                    "清除",
+                    (d, w) -> {
+                        a.prefs.edit().remove(Prefs.LIVE_EPG_URL).apply();
+                        a.toast("已清除自定义 EPG");
+                        if (!a.isTvDevice()) MobileShell.show(a);
+                        else a.refresh();
+                    });
+        }
+        builder.show();
+    }
+
+    private static android.view.View liveDialogAction(
+            MainActivity a, String label, boolean primary, Runnable onClick) {
+        if (a.isTvDevice()) {
+            android.widget.Button b = a.navButton(label, null, onClick);
+            b.setGravity(android.view.Gravity.CENTER);
+            return b;
+        }
+        TextView btn = a.text(label, 13, android.graphics.Color.WHITE);
+        if (primary) btn.setTypeface(null, android.graphics.Typeface.BOLD);
+        btn.setGravity(android.view.Gravity.CENTER);
+        btn.setPadding(a.dp(14), a.dp(11), a.dp(14), a.dp(11));
+        btn.setBackground(a.bg(primary ? 0xff0a84ff : 0xff1e2623, 999));
+        MobileDetailScreen.bindTouchFeedback(btn);
+        btn.setOnClickListener(v -> onClick.run());
+        return btn;
+    }
+
     static void showLiveImportDialog(MainActivity a) {
         LinearLayout panel = a.vertical();
         panel.setPadding(a.dp(4), a.dp(6), a.dp(4), a.dp(4));
 
+        java.util.List<LiveQualityPolicy.CustomLiveSource> savedList =
+                LiveQualityPolicy.parseCustomSources(
+                        a.prefs.getString(Prefs.LIVE_SOURCES_JSON, ""),
+                        a.prefs.getString(Prefs.LIVE_URL, ""),
+                        a.prefs.getString(Prefs.LIVE_NAME, ""));
         TextView tip =
-                a.text("支持 M3U / M3U8 / TXT (#genre#) / JSON 直播源网址或文本：", 13, MainActivity.MUTED);
+                a.text(
+                        "支持叠加导入多份 M3U / TXT (#genre#) / JSON 高清直播源（如 IPv6 源、组播源），同名频道将自动合并优选：",
+                        13,
+                        MainActivity.MUTED);
         panel.addView(tip);
+        if (!savedList.isEmpty()) {
+            a.gap(panel, 6);
+            StringBuilder summary =
+                    new StringBuilder("已添加自定义源（").append(savedList.size()).append("）：");
+            for (int i = 0; i < Math.min(3, savedList.size()); i++) {
+                if (i > 0) summary.append(" · ");
+                summary.append(savedList.get(i).name);
+            }
+            if (savedList.size() > 3) summary.append(" …");
+            panel.addView(a.text(summary.toString(), 12, 0xff60a5fa));
+        }
         a.gap(panel, 10);
 
         final android.widget.EditText input = new android.widget.EditText(a);
-        input.setHint("https://…/live.txt 或 #EXTM3U…");
+        input.setHint("https://…/ipv6.m3u 或 #EXTM3U…（添加新直播源）");
         input.setHintTextColor(0xff6b7280);
         input.setTextColor(MainActivity.WHITE);
         input.setTextSize(14);
         input.setMaxLines(4);
         input.setPadding(a.dp(12), a.dp(10), a.dp(12), a.dp(10));
         input.setBackground(a.bg(0xff1e2623, 12));
-        String savedLive = a.prefs.getString(Prefs.LIVE_URL, "");
-        if (Cms.isHttp(savedLive)) {
-            input.setText(savedLive);
-            input.setSelection(savedLive.length());
-        }
         panel.addView(input, new LinearLayout.LayoutParams(-1, -2));
         a.gap(panel, 12);
 
-        TextView pasteBtn = a.text("📋 从剪贴板一键粘贴直播源", 13, android.graphics.Color.WHITE);
-        pasteBtn.setTypeface(null, android.graphics.Typeface.BOLD);
-        pasteBtn.setGravity(android.view.Gravity.CENTER);
-        pasteBtn.setPadding(a.dp(14), a.dp(11), a.dp(14), a.dp(11));
-        pasteBtn.setBackground(a.bg(0xff0a84ff, 999));
-        MobileDetailScreen.bindTouchFeedback(pasteBtn);
-        panel.addView(pasteBtn, new LinearLayout.LayoutParams(-1, -2));
+        final AppDialog[] holder = new AppDialog[1];
+        panel.addView(
+                liveDialogAction(
+                        a,
+                        "📋 从剪贴板一键粘贴添加直播源",
+                        true,
+                        () -> {
+                            if (holder[0] != null) holder[0].dismiss();
+                            android.content.ClipboardManager cm =
+                                    (android.content.ClipboardManager)
+                                            a.getSystemService(
+                                                    android.content.Context.CLIPBOARD_SERVICE);
+                            String clipText = "";
+                            if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null) {
+                                android.content.ClipData clip = cm.getPrimaryClip();
+                                if (clip.getItemCount() > 0
+                                        && clip.getItemAt(0).getText() != null) {
+                                    clipText = clip.getItemAt(0).getText().toString().trim();
+                                }
+                            }
+                            if (clipText.isEmpty()) {
+                                a.toast("剪贴板为空，请先复制直播源网址或内容");
+                                return;
+                            }
+                            importLiveTextOrUrl(a, clipText);
+                        }),
+                new LinearLayout.LayoutParams(-1, -2));
         a.gap(panel, 8);
 
-        TextView fileBtn = a.text("📂 选择本地直播源文件 (TXT / M3U / JSON)", 13, MainActivity.WHITE);
-        fileBtn.setGravity(android.view.Gravity.CENTER);
-        fileBtn.setPadding(a.dp(14), a.dp(11), a.dp(14), a.dp(11));
-        fileBtn.setBackground(a.bg(0xff1e2623, 999));
-        MobileDetailScreen.bindTouchFeedback(fileBtn);
-        panel.addView(fileBtn, new LinearLayout.LayoutParams(-1, -2));
+        panel.addView(
+                liveDialogAction(
+                        a,
+                        "📂 选择本地直播源文件 (TXT / M3U / JSON)",
+                        false,
+                        () -> {
+                            if (holder[0] != null) holder[0].dismiss();
+                            pickLiveSource(a);
+                        }),
+                new LinearLayout.LayoutParams(-1, -2));
+        a.gap(panel, 8);
+
+        String udpxyCur = a.prefs.getString(Prefs.LIVE_UDPXY_URL, "");
+        panel.addView(
+                liveDialogAction(
+                        a,
+                        udpxyCur.isEmpty() ? "🌐 配置路由器 udpxy 组播转单播网关" : "🌐 udpxy 网关：" + udpxyCur,
+                        false,
+                        () -> {
+                            if (holder[0] != null) holder[0].dismiss();
+                            showUdpxyDialog(a);
+                        }),
+                new LinearLayout.LayoutParams(-1, -2));
+        a.gap(panel, 8);
+
+        String epgCur = a.prefs.getString(Prefs.LIVE_EPG_URL, "");
+        panel.addView(
+                liveDialogAction(
+                        a,
+                        epgCur.isEmpty() ? "📅 配置自定义 XMLTV 节目单 (EPG)" : "📅 自定义 EPG：已配置",
+                        false,
+                        () -> {
+                            if (holder[0] != null) holder[0].dismiss();
+                            showEpgDialog(a);
+                        }),
+                new LinearLayout.LayoutParams(-1, -2));
 
         AppDialog.Builder builder =
                 new AppDialog.Builder(a)
@@ -938,7 +1208,7 @@ final class SourceController {
                         .setView(panel)
                         .setNegativeButton("取消", null)
                         .setPositiveButton(
-                                "导入输入内容",
+                                "添加输入内容",
                                 (d, w) -> {
                                     String raw = input.getText().toString().trim();
                                     if (raw.isEmpty()) {
@@ -947,43 +1217,59 @@ final class SourceController {
                                     }
                                     importLiveTextOrUrl(a, raw);
                                 });
-        if (!savedLive.isEmpty()) {
+        if (!savedList.isEmpty()) {
             builder.setNeutralButton(
-                    "清除自定义直播",
-                    (d, w) -> {
-                        a.prefs.edit().remove(Prefs.LIVE_URL).remove(Prefs.LIVE_NAME).apply();
-                        a.toast("已清除自定义直播源");
-                        if (!a.isTvDevice()) MobileShell.show(a);
-                        else a.refresh();
-                    });
+                    "管理/移除 (" + savedList.size() + ")",
+                    (d, w) -> showManageCustomLiveSourcesDialog(a, savedList));
         }
-        final AppDialog dialog = builder.create();
+        holder[0] = builder.create();
+        holder[0].show();
+    }
 
-        pasteBtn.setOnClickListener(
-                v -> {
-                    dialog.dismiss();
-                    android.content.ClipboardManager cm =
-                            (android.content.ClipboardManager)
-                                    a.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
-                    String clipText = "";
-                    if (cm != null && cm.hasPrimaryClip() && cm.getPrimaryClip() != null) {
-                        android.content.ClipData clip = cm.getPrimaryClip();
-                        if (clip.getItemCount() > 0 && clip.getItemAt(0).getText() != null) {
-                            clipText = clip.getItemAt(0).getText().toString().trim();
-                        }
-                    }
-                    if (clipText.isEmpty()) {
-                        a.toast("剪贴板为空，请先复制直播源网址或内容");
-                        return;
-                    }
-                    importLiveTextOrUrl(a, clipText);
-                });
-        fileBtn.setOnClickListener(
-                v -> {
-                    dialog.dismiss();
-                    pickLiveSource(a);
-                });
-        dialog.show();
+    private static void showManageCustomLiveSourcesDialog(
+            MainActivity a, java.util.List<LiveQualityPolicy.CustomLiveSource> savedList) {
+        String[] labels = new String[savedList.size() + 1];
+        for (int i = 0; i < savedList.size(); i++) {
+            labels[i] = "移除 · " + savedList.get(i).name;
+        }
+        labels[savedList.size()] = "清空全部自定义直播源";
+        new AppDialog.Builder(a)
+                .setTitle("管理已添加的直播源")
+                .setItems(
+                        labels,
+                        (d, idx) -> {
+                            if (idx == savedList.size()) {
+                                a.prefs
+                                        .edit()
+                                        .remove(Prefs.LIVE_SOURCES_JSON)
+                                        .remove(Prefs.LIVE_URL)
+                                        .remove(Prefs.LIVE_NAME)
+                                        .apply();
+                                a.toast("已清空自定义直播源");
+                            } else if (idx >= 0 && idx < savedList.size()) {
+                                java.util.List<LiveQualityPolicy.CustomLiveSource> next =
+                                        new java.util.ArrayList<>(savedList);
+                                LiveQualityPolicy.CustomLiveSource removed = next.remove(idx);
+                                android.content.SharedPreferences.Editor ed = a.prefs.edit();
+                                if (next.isEmpty()) {
+                                    ed.remove(Prefs.LIVE_SOURCES_JSON)
+                                            .remove(Prefs.LIVE_URL)
+                                            .remove(Prefs.LIVE_NAME);
+                                } else {
+                                    ed.putString(
+                                                    Prefs.LIVE_SOURCES_JSON,
+                                                    LiveQualityPolicy.encodeCustomSources(next))
+                                            .putString(Prefs.LIVE_URL, next.get(0).url)
+                                            .putString(Prefs.LIVE_NAME, next.get(0).name);
+                                }
+                                ed.apply();
+                                a.toast("已移除：" + removed.name);
+                            }
+                            if (!a.isTvDevice()) MobileShell.show(a);
+                            else a.refresh();
+                        })
+                .setNegativeButton("返回", null)
+                .show();
     }
 
     static void importLiveTextOrUrl(MainActivity a, String rawInput) {
@@ -1009,12 +1295,26 @@ final class SourceController {
                             LiveCatalog.Catalog cat = LiveCatalog.load(src);
                             count = cat.channelCount();
                             savedUrl = norm;
-                            savedName = "自定义直播 (" + count + "台)";
+                            String hostLabel = "";
+                            try {
+                                hostLabel = new java.net.URI(norm).getHost();
+                            } catch (Exception ignored) {
+                            }
+                            savedName =
+                                    (hostLabel != null && !hostLabel.isEmpty()
+                                                    ? hostLabel
+                                                    : "自定义直播")
+                                            + " ("
+                                            + count
+                                            + "台)";
                         } else {
                             LiveCatalog.Catalog cat = LiveCatalog.parse(text, "", null);
                             count = cat.channelCount();
+                            String suffix = LiveQualityPolicy.metricKey(text);
+                            if (suffix.length() > 8) suffix = suffix.substring(0, 8);
                             java.io.File liveFile =
-                                    new java.io.File(a.getFilesDir(), "custom_live.txt");
+                                    new java.io.File(
+                                            a.getFilesDir(), "custom_live_" + suffix + ".txt");
                             try (java.io.OutputStream out =
                                     new java.io.FileOutputStream(liveFile)) {
                                 out.write(text.getBytes("UTF-8"));
@@ -1024,12 +1324,8 @@ final class SourceController {
                         }
                         a.ui.post(
                                 () -> {
-                                    a.prefs
-                                            .edit()
-                                            .putString(Prefs.LIVE_URL, savedUrl)
-                                            .putString(Prefs.LIVE_NAME, savedName)
-                                            .apply();
-                                    a.toast("直播源导入成功（共 " + count + " 个频道）");
+                                    upsertCustomLiveSource(a, savedName, savedUrl);
+                                    a.toast("直播源添加成功（共 " + count + " 个频道）");
                                     if (!a.isTvDevice()) MobileShell.show(a);
                                     else a.refresh();
                                 });
@@ -1148,8 +1444,11 @@ final class SourceController {
                                 || lowerName.endsWith(".txt")) {
                             try {
                                 LiveCatalog.Catalog cat = LiveCatalog.parse(text, "", null);
+                                String suffix = LiveQualityPolicy.metricKey(text);
+                                if (suffix.length() > 8) suffix = suffix.substring(0, 8);
                                 java.io.File liveFile =
-                                        new java.io.File(a.getFilesDir(), "custom_live.txt");
+                                        new java.io.File(
+                                                a.getFilesDir(), "custom_live_" + suffix + ".txt");
                                 try (java.io.OutputStream out =
                                         new java.io.FileOutputStream(liveFile)) {
                                     out.write(text.getBytes("UTF-8"));
@@ -1159,12 +1458,8 @@ final class SourceController {
                                 final String liveName = displayName + " (" + count + "台)";
                                 a.ui.post(
                                         () -> {
-                                            a.prefs
-                                                    .edit()
-                                                    .putString(Prefs.LIVE_URL, liveUrl)
-                                                    .putString(Prefs.LIVE_NAME, liveName)
-                                                    .apply();
-                                            a.toast("直播源导入成功（共 " + count + " 个频道）");
+                                            upsertCustomLiveSource(a, liveName, liveUrl);
+                                            a.toast("直播源添加成功（共 " + count + " 个频道）");
                                             if (!a.isTvDevice()) MobileShell.show(a);
                                             else a.refresh();
                                         });
@@ -1231,14 +1526,9 @@ final class SourceController {
                                 final int count = cat.channelCount();
                                 a.ui.post(
                                         () -> {
-                                            a.prefs
-                                                    .edit()
-                                                    .putString(Prefs.LIVE_URL, liveUrl)
-                                                    .putString(
-                                                            Prefs.LIVE_NAME,
-                                                            "本地直播 (" + count + "台)")
-                                                    .apply();
-                                            a.toast("已识别并导入直播源（共 " + count + " 个频道）");
+                                            upsertCustomLiveSource(
+                                                    a, "本地直播 (" + count + "台)", liveUrl);
+                                            a.toast("已识别并添加直播源（共 " + count + " 个频道）");
                                             if (!a.isTvDevice()) MobileShell.show(a);
                                             else a.refresh();
                                         });
@@ -1254,11 +1544,7 @@ final class SourceController {
 
     static void applyLocalPackage(MainActivity a, LocalSourcePackage pkg) throws Exception {
         if (pkg.liveChannels > 0) {
-            a.prefs
-                    .edit()
-                    .putString(Prefs.LIVE_URL, pkg.origin)
-                    .putString(Prefs.LIVE_NAME, "本地包直播 (" + pkg.liveChannels + "台)")
-                    .apply();
+            upsertCustomLiveSource(a, "本地包直播 (" + pkg.liveChannels + "台)", pkg.origin);
             a.toast("本地播放列表导入成功（共 " + pkg.liveChannels + " 个频道）");
             if (!a.isTvDevice()) MobileShell.show(a);
             else a.refresh();
